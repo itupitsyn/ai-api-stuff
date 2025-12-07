@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from enum import Enum
 
+
 class ProcessType(Enum):
     IMAGE_GENERATION = "img_gen"
     TRANSCRIPTION = "trans"
@@ -222,19 +223,22 @@ def generate_transcription(audio_file: str, return_dict):
         audio = whisperx.load_audio(audio_file)
         result = model.transcribe(audio, batch_size=16)
 
+        language_code = result["language"]
+
         # 2. Align whisper output
         model_a, metadata = whisperx.load_align_model(
-            language_code=result["language"], device=device)
+            language_code=language_code, device=device)
         result = whisperx.align(
             result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
 
         # 3. Assign speaker labels
         diarize_model = whisperx.diarize.DiarizationPipeline(
-            use_auth_token=os.getenv("HF_API_KEY"), device=device)
+            use_auth_token=os.getenv("HF_API_KEY"), device=device, model_name="pyannote/speaker-diarization-3.1")
 
         diarize_segments = diarize_model(audio)
 
         result = whisperx.assign_word_speakers(diarize_segments, result)
+        result["language"] = language_code
 
         return_dict["res"] = result
 
