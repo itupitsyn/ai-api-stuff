@@ -1,0 +1,35 @@
+# x-def-logging: &default-logging
+#   logging:
+#     driver: "loki"
+#     options:
+#       loki-url: "http://192.168.1.86:3100/loki/api/v1/push"
+#       loki-batch-size: "400"
+
+services:
+  ai-api-stuff:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-api-stuff
+    
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    
+    environment:
+      - PYTHONUNBUFFERED=1
+    ports:
+      - 8000:8000
+    
+    volumes:
+      - .:/root
+  
+    command: ["fastapi", "run", "main.py", "--port", "8000"]
+
+    restart: unless-stopped
+
+    # <<: *default-logging

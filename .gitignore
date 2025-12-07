@@ -1,0 +1,7 @@
+.env
+zimage
+files
+.nv
+.config
+.cache
+__pycache__
