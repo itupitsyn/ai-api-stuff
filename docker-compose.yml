@@ -11,7 +11,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ai-api-stuff
-    
+    privileged: true
+
     deploy:
       resources:
         reservations:
