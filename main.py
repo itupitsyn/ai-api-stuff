@@ -18,6 +18,18 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from enum import Enum
 
+import huggingface_hub
+from huggingface_hub.utils import http_backoff
+
+# Магия: перехватываем вызовы к HF и перенаправляем старый аргумент в новый
+original_hf_hub_download = huggingface_hub.hf_hub_download
+
+def patched_hf_hub_download(*args, **kwargs):
+    if 'use_auth_token' in kwargs:
+        kwargs['token'] = kwargs.pop('use_auth_token')
+    return original_hf_hub_download(*args, **kwargs)
+
+huggingface_hub.hf_hub_download = patched_hf_hub_download
 
 class ProcessType(Enum):
     IMAGE_GENERATION = "img_gen"

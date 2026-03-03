@@ -11,18 +11,19 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ai-api-stuff
-    privileged: true
+    privileged: false
 
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ['1']
               capabilities: [gpu]
     
     environment:
       - PYTHONUNBUFFERED=1
+
     ports:
       - 8000:8000
     

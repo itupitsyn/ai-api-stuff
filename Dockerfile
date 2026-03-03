@@ -15,9 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     git
 
-COPY .env main.py requirements.txt ./
-
+COPY requirements.txt .
 RUN pip3 install -r requirements.txt
+
+COPY .env main.py ./
 
 ENV PYTHONUNBUFFERED=1
 
