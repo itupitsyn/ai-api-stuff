@@ -13,15 +13,26 @@ services:
     container_name: ai-api-stuff
     privileged: false
 
+    cap_add:
+      - SYS_ADMIN
+    shm_size: '2gb' # Для ML-задач это мастхэв, чтобы не было ошибок памяти
+
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['1']
-              capabilities: [gpu]
-    
+              device_ids: ['0']
+              capabilities: [gpu, utility, compute]
+    devices:
+      - /dev/nvidia0:/dev/nvidia0       # Прокидываем именно ноду Neptune
+      - /dev/nvidiactl:/dev/nvidiactl   # Общий контроллер (нужен всегда)
+      - /dev/nvidia-uvm:/dev/nvidia-uvm # Для работы с памятью (нужен всегда)
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools # Добавь этот узел для инструментов мониторинга
+  
     environment:
+      - NVIDIA_VISIBLE_DEVICES=0 # Явно укажем переменную окружения
+      - NVIDIA_DRIVER_CAPABILITIES=all
       - PYTHONUNBUFFERED=1
 
     ports:
@@ -30,7 +41,7 @@ services:
     volumes:
       - .:/root
   
-    command: ["fastapi", "run", "main.py", "--port", "8000"]
+    command: ["fastapi", "run", "main.py", "--port", "8000", "--no-reload"]
 
     restart: unless-stopped
 

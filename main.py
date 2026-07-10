@@ -18,6 +18,9 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from enum import Enum
 
+import torch, pandas as pd
+from pyannote.audio import Pipeline
+
 import huggingface_hub
 from huggingface_hub.utils import http_backoff
 
@@ -162,7 +165,7 @@ async def transcription(file: UploadFile):
     id = str(uuid.uuid4())
     print("trans", id)
 
-    filename = f"files/{id}.{extension}"
+    filename = f"files/{id}{extension}"
     with open(filename, "wb") as f:
         f.write(file.file.read())
 
@@ -214,7 +217,7 @@ def generate_image(prompt: str, return_dict):
         return_dict["res"] = image
     except Exception as e:
         print(e)
-        return_dict["res"] = {"error": e}
+        return_dict["res"] = {"error": str(e)}
 
 
 def generate_transcription(audio_file: str, return_dict):
@@ -230,7 +233,7 @@ def generate_transcription(audio_file: str, return_dict):
         torch.load = _trusted_load
 
         # 1. Transcribe with original whisper (batched)
-        model = whisperx.load_model("large-v3", device, compute_type="float16")
+        model = whisperx.load_model("large-v3", device, compute_type="float16", vad_method="silero")
 
         audio = whisperx.load_audio(audio_file)
         result = model.transcribe(audio, batch_size=16)
@@ -244,16 +247,31 @@ def generate_transcription(audio_file: str, return_dict):
             result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
 
         # 3. Assign speaker labels
-        diarize_model = whisperx.diarize.DiarizationPipeline(
-            use_auth_token=os.getenv("HF_API_KEY"), device=device, model_name="pyannote/speaker-diarization-3.1")
+        diarize_pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-community-1",
+            token=os.getenv("HF_API_KEY"),          # в 4.x параметр называется token
+        ).to(torch.device(device))
+        
+        diarization = diarize_pipeline({
+            "waveform": torch.from_numpy(audio[None, :]),
+            "sample_rate": 16000,
+        })
+        
+        annotation = diarization.speaker_diarization
+        
+        # конвертим Annotation → DataFrame в формате, который ждёт assign_word_speakers
+        diarize_df = pd.DataFrame(
+            [(t.start, t.end, spk) for t, _, spk in annotation.itertracks(yield_label=True)],
+            columns=["start", "end", "speaker"],
+        )
+        print("SPEAKERS:", diarize_df["speaker"].unique())
 
-        diarize_segments = diarize_model(audio)
+        result = whisperx.assign_word_speakers(diarize_df, result)
 
-        result = whisperx.assign_word_speakers(diarize_segments, result)
         result["language"] = language_code
 
         return_dict["res"] = result
 
     except Exception as e:
         print(e)
-        return_dict["res"] = {"error": e}
+        return_dict["res"] = {"error": str(e)}

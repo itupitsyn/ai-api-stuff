@@ -22,4 +22,4 @@ COPY .env main.py ./
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["fastapi", "run", "main.py", "--port", "8000"]
+CMD ["fastapi", "run", "main.py", "--port", "8000", "--no-reload"]
