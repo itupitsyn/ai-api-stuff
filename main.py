@@ -8,9 +8,11 @@ import threading
 import multiprocessing
 import uuid
 import base64
+import tempfile
 
-from diffusers import ZImagePipeline
-from fastapi import FastAPI, UploadFile
+from diffusers import ZImagePipeline, WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline, UniPCMultistepScheduler
+from diffusers.utils import export_to_video, load_image
+from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import Response
 from io import BytesIO
 from pydantic import BaseModel
@@ -37,6 +39,8 @@ huggingface_hub.hf_hub_download = patched_hf_hub_download
 class ProcessType(Enum):
     IMAGE_GENERATION = "img_gen"
     TRANSCRIPTION = "trans"
+    T2V = 't2v'
+    I2V = 'i2v'
 
 
 class Status(Enum):
@@ -48,6 +52,9 @@ class Status(Enum):
 
 class Item(BaseModel):
     prompt: str
+    width: int = 832
+    height: int = 480
+    fps: int = 30
 
 
 def worker(results, lock, q):
@@ -92,6 +99,49 @@ def worker(results, lock, q):
                 with lock:
                     results[id] = {"status": Status.DONE,
                                    "data": base64.b64encode(filtered_image.read())}
+
+        elif type == ProcessType.T2V:
+            with lock:
+                results[id] = {"status": Status.IN_PROGRESS}
+
+            process = mp_context.Process(
+                target=generate_t2v,
+                args=(data.prompt, data.width, data.height, data.fps, return_dict))
+            process.start()
+            process.join()
+
+            video_bytes = return_dict.get("res")
+
+            if isinstance(video_bytes, dict):
+                with lock:
+                    results[id] = {"status": Status.ERROR,
+                                   "data": video_bytes.get("error")}
+            else:
+                with lock:
+                    results[id] = {"status": Status.DONE,
+                                   "data": base64.b64encode(video_bytes)}
+
+        elif type == ProcessType.I2V:
+            with lock:
+                results[id] = {"status": Status.IN_PROGRESS}
+
+            process = mp_context.Process(
+                target=generate_i2v,
+                args=(data["prompt"], data["image"], data["width"],
+                      data["height"], data["fps"], return_dict))
+            process.start()
+            process.join()
+
+            video_bytes = return_dict.get("res")
+
+            if isinstance(video_bytes, dict):
+                with lock:
+                    results[id] = {"status": Status.ERROR,
+                                   "data": video_bytes.get("error")}
+            else:
+                with lock:
+                    results[id] = {"status": Status.DONE,
+                                   "data": base64.b64encode(video_bytes)}
 
         elif type == ProcessType.TRANSCRIPTION:
             with lock:
@@ -171,6 +221,40 @@ async def transcription(file: UploadFile):
 
     q.put({"id": id, "type": ProcessType.TRANSCRIPTION,
           "data": {"filename": filename}})
+    with lock:
+        results[id] = {"status": Status.PENDING}
+
+    return {"id": id}
+
+
+@app.post("/api/t2v")
+async def t2v(item: Item):
+    id = str(uuid.uuid4())
+    print("t2v", id)
+    q.put({"id": id, "type": ProcessType.T2V, "data": item})
+    with lock:
+        results[id] = {"status": Status.PENDING}
+
+    return {"id": id}
+
+
+@app.post("/api/i2v")
+async def i2v(
+    file: UploadFile,
+    prompt: str = Form(...),
+    width: int = Form(832),
+    height: int = Form(480),
+    fps: int = Form(30),
+):
+    id = str(uuid.uuid4())
+    print("i2v", id)
+    image = await file.read()
+    q.put({
+        "id": id,
+        "type": ProcessType.I2V,
+        "data": {"prompt": prompt, "image": image,
+                 "width": width, "height": height, "fps": fps},
+    })
     with lock:
         results[id] = {"status": Status.PENDING}
 
@@ -271,6 +355,138 @@ def generate_transcription(audio_file: str, return_dict):
         result["language"] = language_code
 
         return_dict["res"] = result
+
+    except Exception as e:
+        print(e)
+        return_dict["res"] = {"error": str(e)}
+
+
+def generate_t2v(prompt: str, width: int, height: int, fps: int, return_dict):
+    try:
+        MODEL_ID = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+        USE_ACCELERATOR_LORA = True  # False = медленнее, но без LoRA
+
+        vae = AutoencoderKLWan.from_pretrained(MODEL_ID, subfolder="vae", torch_dtype=torch.float32)
+        pipe = WanPipeline.from_pretrained(MODEL_ID, vae=vae, torch_dtype=torch.bfloat16)
+
+        if USE_ACCELERATOR_LORA:
+            # LoRA грузится ОТДЕЛЬНО на high-noise (pipe.transformer) и low-noise (pipe.transformer_2)
+            pipe.load_lora_weights(
+                "lightx2v/Wan2.2-Lightning",
+                weight_name="Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
+                adapter_name="high",
+            )
+            pipe.load_lora_weights(
+                "lightx2v/Wan2.2-Lightning",
+                weight_name="Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors",
+                adapter_name="low",
+            )
+            # high-noise адаптер активен только на pipe.transformer, low — на pipe.transformer_2
+            pipe.set_adapters(["high"])
+            pipe.transformer_2.set_adapters(["low"])
+
+            pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
+            num_steps = 4
+            guidance, guidance_2 = 1.0, 1.0
+        else:
+            pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
+            num_steps = 40
+            guidance, guidance_2 = 4.0, 3.0  # обычные значения для двух экспертов без дистилляции
+
+        # Критично для 24 ГБ: выгружаем неактивные части на CPU по мере необходимости
+        pipe.enable_sequential_cpu_offload()
+
+        negative_prompt = (
+            "яркие цвета, засветка, статичность, размытые детали, субтитры, "
+            "низкое качество, деформированные конечности, сросшиеся пальцы"
+        )
+
+        video = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_frames=81,           # 4*k+1 кадров, тут k=20
+            guidance_scale=guidance,
+            guidance_scale_2=guidance_2,   # отдельный guidance для low-noise эксперта
+            num_inference_steps=num_steps,
+        ).frames[0]
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            export_to_video(video, tmp_path, fps=fps)
+            with open(tmp_path, "rb") as f:
+                return_dict["res"] = f.read()
+        finally:
+            os.unlink(tmp_path)
+
+    except Exception as e:
+        print(e)
+        return_dict["res"] = {"error": str(e)}
+
+def generate_i2v(prompt: str, image_bytes: bytes, width: int, height: int, fps: int, return_dict):
+    try:
+        from PIL import Image
+
+        MODEL_ID = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+        USE_ACCELERATOR_LORA = True
+
+        vae = AutoencoderKLWan.from_pretrained(MODEL_ID, subfolder="vae", torch_dtype=torch.float32)
+        pipe = WanImageToVideoPipeline.from_pretrained(MODEL_ID, vae=vae, torch_dtype=torch.bfloat16)
+
+        if USE_ACCELERATOR_LORA:
+            # ВНИМАНИЕ: проверь точные имена I2V-весов в репо lightx2v/Wan2.2-Lightning
+            pipe.load_lora_weights(
+                "lightx2v/Wan2.2-Lightning",
+                weight_name="Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
+                adapter_name="high",
+            )
+            pipe.load_lora_weights(
+                "lightx2v/Wan2.2-Lightning",
+                weight_name="Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors",
+                adapter_name="low",
+            )
+            pipe.set_adapters(["high"])
+            pipe.transformer_2.set_adapters(["low"])
+
+            pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
+            num_steps = 4
+            guidance, guidance_2 = 1.0, 1.0
+        else:
+            pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
+            num_steps = 40
+            guidance, guidance_2 = 3.5, 3.5
+
+        pipe.enable_sequential_cpu_offload()
+
+        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+
+        negative_prompt = (
+            "яркие цвета, засветка, статичность, размытые детали, субтитры, "
+            "низкое качество, деформированные конечности, сросшиеся пальцы"
+        )
+
+        video = pipe(
+            image=image,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_frames=81,
+            guidance_scale=guidance,
+            guidance_scale_2=guidance_2,
+            num_inference_steps=num_steps,
+        ).frames[0]
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            export_to_video(video, tmp_path, fps=fps)
+            with open(tmp_path, "rb") as f:
+                return_dict["res"] = f.read()
+        finally:
+            os.unlink(tmp_path)
 
     except Exception as e:
         print(e)
