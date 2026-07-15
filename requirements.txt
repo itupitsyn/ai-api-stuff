@@ -2,16 +2,17 @@
 accelerate
 peft
 ftfy
-torch==2.8.0
-torchaudio==2.8.0
-torchvision==0.23.0
+torch==2.11.0
+torchaudio==2.11.0
+torchvision==0.26.0
+torchcodec>=0.14,<0.15  # ABI-совместим с torch 2.11
 pyannote.audio>=4.0
 omegaconf
 fastapi[standard]
 transformers
 whisperx
 dotenv
-torchao
+torchao==0.17.0  # совместим с torch 2.11; включает diffusers-нативный fp8 (TorchAoConfig + LoRA-on-quantized + offload)
 imageio
 imageio-ffmpeg
 git+https://github.com/huggingface/diffusers

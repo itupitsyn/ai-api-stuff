@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcudnn8 \
     python3 \
     python3-pip \
+    libpython3.10 \
     git
 
 COPY requirements.txt .

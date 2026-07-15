@@ -2,7 +2,6 @@ import torch
 import sys
 import queue
 import random
-import whisperx
 import os
 import threading
 import multiprocessing
@@ -23,8 +22,11 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from enum import Enum
 
-import torch, pandas as pd
-from pyannote.audio import Pipeline
+# whisperx / pyannote / pandas импортируются ЛЕНИВО внутри _run_transcription.
+# Это тяжёлый и капризный аудио-стек (torchcodec/ffmpeg): грузим только когда
+# реально нужен. Плюсы — spawn-потомок сборки fp8-кэша не тащит его в память,
+# и поломка аудио-стека не роняет весь сервер на старте (страдает только
+# транскрипция, видео работает). Цена — ~пара секунд на первой транскрипции.
 
 import huggingface_hub
 from huggingface_hub.utils import http_backoff
@@ -41,6 +43,7 @@ def patched_hf_hub_download(*args, **kwargs):
     return original_hf_hub_download(*args, **kwargs)
 
 huggingface_hub.hf_hub_download = patched_hf_hub_download
+
 
 class ProcessType(Enum):
     IMAGE_GENERATION = "img_gen"
@@ -79,14 +82,8 @@ VIDEO_TYPES = (ProcessType.T2V, ProcessType.I2V)
 USE_FP8 = True
 
 # Wan VAE в fp32 стабильнее (меньше артефактов), но декод медленнее и жрёт память.
-# ComfyUI гоняет VAE в bf16 — попробуй False ради скорости, если картинка не поплывёт.
-VAE_FP32 = True
-
-# Куда кэшировать fp8-веса трансформеров. Первый раз: читаем bf16 + квантуем +
-# сохраняем сюда (медленно). Дальше КАЖДАЯ загрузка (в т.ч. после recycle) читает
-# готовый fp8 отсюда — вдвое меньше диска, без повторной квантизации.
-FP8_CACHE_DIR = os.getenv("FP8_CACHE_DIR", os.path.expanduser("~/.cache/wan_fp8"))
-FP8_QUANT = "float8wo"  # weight-only fp8 (считает в bf16). Строка зависит от версии torchao/diffusers.
+# ComfyUI гоняет VAE в bf16. Ставим False ради скорости — верни True, если видео поплывёт.
+VAE_FP32 = False
 
 
 # ==========================================================================
@@ -118,88 +115,99 @@ def _vae_dtype():
     return torch.float32 if VAE_FP32 else torch.bfloat16
 
 
-def _load_fp8_transformer(model_id, subfolder, cache_key):
-    """Возвращает fp8-квантованный трансформер, кэшируя его на диск.
+# Реестр видео-моделей (t2v/i2v в одном месте, без дублей в билдерах).
+WAN_MODELS = {
+    "t2v": {
+        "pipe_cls": WanPipeline,
+        "model_id": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        "lora_high": "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
+        "lora_low": "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors",
+    },
+    # ВНИМАНИЕ: проверь точные имена I2V-весов в репо lightx2v/Wan2.2-Lightning
+    "i2v": {
+        "pipe_cls": WanImageToVideoPipeline,
+        "model_id": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        "lora_high": "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
+        "lora_low": "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors",
+    },
+}
 
-    Первый раз: читаем bf16 с квантизацией на лету (TorchAoConfig) и сохраняем
-    fp8 в FP8_CACHE_DIR. Дальше — читаем готовый fp8 напрямую (вдвое меньше диска,
-    без повторной квантизации), в т.ч. на каждом релоаде после recycle.
+WAN_META = {"num_steps": 4, "guidance": 1.0, "guidance_2": 1.0}
+
+
+def _vae_of(model_id):
+    return AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=_vae_dtype())
+
+
+def _fp8_quant_config():
+    # diffusers ждёт объект torchao AOBaseConfig. Weight-only fp8: веса в fp8,
+    # матмул в bf16 — работает и на Ampere (3090), и на Ada (4090).
+    from torchao.quantization import Float8WeightOnlyConfig
+    return TorchAoConfig(Float8WeightOnlyConfig())
+
+
+def _quantize_transformer(model_id, subfolder):
+    """fp8-квантованный трансформер (свежая квантизация через TorchAoConfig).
+
+    БЕЗ дискового кэша: роундтрип квантованной модели в этом стеке принципиально
+    сломан — save_pretrained шардит без индекса, torch.save(module) не пиклит
+    (torchao патчит forward через functools.partial), а from_config+assign теряет
+    метаданные квантизации (hf_quantizer), из-за чего падает инъекция LoRA
+    (TorchaoLoraLinear ... missing get_apply_tensor_subclass). Только свежая
+    квантизация даёт полностью рабочую модель (LoRA + offload на GPU).
     """
-    cache_dir = os.path.join(FP8_CACHE_DIR, cache_key)
-
-    if os.path.isdir(cache_dir):
-        print(f"[fp8] load cached {cache_key}", flush=True)
-        return WanTransformer3DModel.from_pretrained(cache_dir, torch_dtype=torch.bfloat16)
-
-    print(f"[fp8] quantize+cache {cache_key} (first run, slow)", flush=True)
-    transformer = WanTransformer3DModel.from_pretrained(
+    print(f"[fp8] quantize {model_id.split('/')[-1]}/{subfolder}", flush=True)
+    return WanTransformer3DModel.from_pretrained(
         model_id, subfolder=subfolder,
-        quantization_config=TorchAoConfig(FP8_QUANT),
-        torch_dtype=torch.bfloat16,
-    )
-    # torchao-веса нельзя сериализовать в safetensors (tensor-subclass) → обычный формат
-    transformer.save_pretrained(cache_dir, safe_serialization=False)
-    return transformer
+        quantization_config=_fp8_quant_config(), torch_dtype=torch.bfloat16)
 
 
-def _load_wan_pipe(pipe_cls, model_id, cache_prefix):
-    """Собирает Wan-пайплайн. При USE_FP8 подставляет fp8-трансформеры из кэша."""
-    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=_vae_dtype())
+def _build_wan_fp8(kind):
+    """fp8-путь: свежеквантованные трансформеры + LoRA поверх + model_cpu_offload.
+    На torch 2.11 / torchao 0.17 diffusers знает про квантизацию, поэтому offload
+    корректно двигает fp8-веса на GPU (а не оставляет на CPU)."""
+    m = WAN_MODELS[kind]
+    transformer = _quantize_transformer(m["model_id"], "transformer")
+    transformer_2 = _quantize_transformer(m["model_id"], "transformer_2")
 
-    if USE_FP8:
-        transformer = _load_fp8_transformer(model_id, "transformer", f"{cache_prefix}_high")
-        transformer_2 = _load_fp8_transformer(model_id, "transformer_2", f"{cache_prefix}_low")
-        return pipe_cls.from_pretrained(
-            model_id, transformer=transformer, transformer_2=transformer_2,
-            vae=vae, torch_dtype=torch.bfloat16,
-        )
+    pipe = m["pipe_cls"].from_pretrained(
+        m["model_id"], transformer=transformer, transformer_2=transformer_2,
+        vae=_vae_of(m["model_id"]), torch_dtype=torch.bfloat16)
 
-    return pipe_cls.from_pretrained(model_id, vae=vae, torch_dtype=torch.bfloat16)
-
-
-def _setup_wan_lora(pipe, lora_high_name, lora_low_name):
-    """LoRA-ускоритель (4 шага) поверх базы + планировщик + оффлоад.
-
-    LoRA вешаем СВЕРХУ (как LoraLoaderModelOnly у ComfyUI): high→transformer,
-    low→transformer_2. При USE_FP8 fp8-эксперт (~14 ГБ) влезает в VRAM целиком,
-    поэтому model_cpu_offload свопает эксперты по одному, а не стримит послойно.
-    """
-    pipe.load_lora_weights("lightx2v/Wan2.2-Lightning", weight_name=lora_high_name, adapter_name="high")
-    pipe.load_lora_weights("lightx2v/Wan2.2-Lightning", weight_name=lora_low_name, adapter_name="low")
+    # LoRA-ускоритель поверх квантованной базы (как LoraLoaderModelOnly у ComfyUI)
+    pipe.load_lora_weights("lightx2v/Wan2.2-Lightning", weight_name=m["lora_high"], adapter_name="high")
+    pipe.load_lora_weights("lightx2v/Wan2.2-Lightning", weight_name=m["lora_low"], adapter_name="low")
     pipe.set_adapters(["high"])
     pipe.transformer_2.set_adapters(["low"])
 
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
+    pipe.enable_model_cpu_offload()
+    return pipe
 
-    if USE_FP8:
-        pipe.enable_model_cpu_offload()       # своп экспертов, не послойный стриминг
-    else:
-        pipe.enable_sequential_cpu_offload()  # bf16 не влезает → послойный оффлоад
+
+def _build_wan_bf16(kind):
+    """Рабочий bf16-путь (USE_FP8=False): LoRA как адаптеры + sequential offload."""
+    m = WAN_MODELS[kind]
+    pipe = m["pipe_cls"].from_pretrained(m["model_id"], vae=_vae_of(m["model_id"]), torch_dtype=torch.bfloat16)
+    pipe.load_lora_weights("lightx2v/Wan2.2-Lightning", weight_name=m["lora_high"], adapter_name="high")
+    pipe.load_lora_weights("lightx2v/Wan2.2-Lightning", weight_name=m["lora_low"], adapter_name="low")
+    pipe.set_adapters(["high"])
+    pipe.transformer_2.set_adapters(["low"])
+    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
+    pipe.enable_sequential_cpu_offload()
+    return pipe
+
+
+def _build_wan(kind):
+    return _build_wan_fp8(kind) if USE_FP8 else _build_wan_bf16(kind)
 
 
 def _build_t2v_pipe():
-    MODEL_ID = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
-
-    pipe = _load_wan_pipe(WanPipeline, MODEL_ID, "wan_t2v")
-    _setup_wan_lora(
-        pipe,
-        "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
-        "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors",
-    )
-    return pipe, {"num_steps": 4, "guidance": 1.0, "guidance_2": 1.0}
+    return _build_wan("t2v"), dict(WAN_META)
 
 
 def _build_i2v_pipe():
-    MODEL_ID = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
-
-    pipe = _load_wan_pipe(WanImageToVideoPipeline, MODEL_ID, "wan_i2v")
-    # ВНИМАНИЕ: проверь точные имена I2V-весов в репо lightx2v/Wan2.2-Lightning
-    _setup_wan_lora(
-        pipe,
-        "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
-        "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors",
-    )
-    return pipe, {"num_steps": 4, "guidance": 1.0, "guidance_2": 1.0}
+    return _build_wan("i2v"), dict(WAN_META)
 
 
 def _build_image_pipe():
@@ -233,6 +241,8 @@ def _free_cuda():
 def _run_t2v(data):
     pipe, meta = _get_pipe(ProcessType.T2V, _build_t2v_pipe)
 
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     t_inf = time.time()
     video = pipe(
         prompt=data.prompt,
@@ -244,7 +254,9 @@ def _run_t2v(data):
         guidance_scale_2=meta["guidance_2"],   # отдельный guidance для low-noise эксперта
         num_inference_steps=meta["num_steps"],
     ).frames[0]
-    print(f"[t2v] inference: {time.time() - t_inf:.1f}s", flush=True)
+    # peak VRAM ~0 → инференс идёт на CPU; ~14 ГБ → на GPU (диагностика fp8+offload)
+    peak = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+    print(f"[t2v] inference: {time.time() - t_inf:.1f}s | peak VRAM {peak:.1f} GB | cuda={torch.cuda.is_available()}", flush=True)
 
     return _video_to_bytes(video, data.fps)
 
@@ -256,6 +268,8 @@ def _run_i2v(data):
 
     image = Image.open(BytesIO(data["image"])).convert("RGB")
 
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     t_inf = time.time()
     video = pipe(
         image=image,
@@ -268,7 +282,8 @@ def _run_i2v(data):
         guidance_scale_2=meta["guidance_2"],
         num_inference_steps=meta["num_steps"],
     ).frames[0]
-    print(f"[i2v] inference: {time.time() - t_inf:.1f}s", flush=True)
+    peak = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+    print(f"[i2v] inference: {time.time() - t_inf:.1f}s | peak VRAM {peak:.1f} GB | cuda={torch.cuda.is_available()}", flush=True)
 
     return _video_to_bytes(video, data["fps"])
 
@@ -289,7 +304,13 @@ def _run_image(data):
 
 
 def _run_transcription(data):
-    # Транзиентно: whisperx грузит свои модели и освобождает после, видео-слот не трогаем
+    # Транзиентно: whisperx грузит свои модели и освобождает после, видео-слот не трогаем.
+    # Импорты ленивые — см. комментарий у секции импортов (тяжёлый аудио-стек,
+    # грузим только здесь, где он реально нужен).
+    import whisperx
+    import pandas as pd
+    from pyannote.audio import Pipeline
+
     audio_file = data["filename"]
     device = "cuda"
 
