@@ -11,6 +11,7 @@ fastapi[standard]
 transformers
 whisperx
 dotenv
+torchao
 imageio
 imageio-ffmpeg
 git+https://github.com/huggingface/diffusers

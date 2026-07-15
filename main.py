@@ -13,7 +13,7 @@ import time
 import gc
 import traceback
 
-from diffusers import ZImagePipeline, WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline, UniPCMultistepScheduler
+from diffusers import ZImagePipeline, WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline, UniPCMultistepScheduler, WanTransformer3DModel, TorchAoConfig
 from diffusers.utils import export_to_video, load_image
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import Response
@@ -72,6 +72,22 @@ NEG_PROMPT = (
 # вместе не влезают). Картинки/аудио грузятся транзиентно и слот не трогают.
 VIDEO_TYPES = (ProcessType.T2V, ProcessType.I2V)
 
+# fp8-квантизация трансформеров Wan (по образцу ComfyUI): эксперт ужимается
+# ~28→14 ГБ и влезает в VRAM целиком, поэтому model_cpu_offload свопает эксперты
+# по одному, а не стримит веса послойно (как sequential). Это и есть тот 4x на
+# инференсе (~300с → ~100с по цифрам ComfyUI). False = рабочий bf16-путь.
+USE_FP8 = True
+
+# Wan VAE в fp32 стабильнее (меньше артефактов), но декод медленнее и жрёт память.
+# ComfyUI гоняет VAE в bf16 — попробуй False ради скорости, если картинка не поплывёт.
+VAE_FP32 = True
+
+# Куда кэшировать fp8-веса трансформеров. Первый раз: читаем bf16 + квантуем +
+# сохраняем сюда (медленно). Дальше КАЖДАЯ загрузка (в т.ч. после recycle) читает
+# готовый fp8 отсюда — вдвое меньше диска, без повторной квантизации.
+FP8_CACHE_DIR = os.getenv("FP8_CACHE_DIR", os.path.expanduser("~/.cache/wan_fp8"))
+FP8_QUANT = "float8wo"  # weight-only fp8 (считает в bf16). Строка зависит от версии torchao/diffusers.
+
 
 # ==========================================================================
 #  GPU-СТОРОНА: исполняется в одном долгоживущем процессе.
@@ -98,69 +114,92 @@ def _get_pipe(ptype, builder):
     return _slot["pipe"], _slot["meta"]
 
 
+def _vae_dtype():
+    return torch.float32 if VAE_FP32 else torch.bfloat16
+
+
+def _load_fp8_transformer(model_id, subfolder, cache_key):
+    """Возвращает fp8-квантованный трансформер, кэшируя его на диск.
+
+    Первый раз: читаем bf16 с квантизацией на лету (TorchAoConfig) и сохраняем
+    fp8 в FP8_CACHE_DIR. Дальше — читаем готовый fp8 напрямую (вдвое меньше диска,
+    без повторной квантизации), в т.ч. на каждом релоаде после recycle.
+    """
+    cache_dir = os.path.join(FP8_CACHE_DIR, cache_key)
+
+    if os.path.isdir(cache_dir):
+        print(f"[fp8] load cached {cache_key}", flush=True)
+        return WanTransformer3DModel.from_pretrained(cache_dir, torch_dtype=torch.bfloat16)
+
+    print(f"[fp8] quantize+cache {cache_key} (first run, slow)", flush=True)
+    transformer = WanTransformer3DModel.from_pretrained(
+        model_id, subfolder=subfolder,
+        quantization_config=TorchAoConfig(FP8_QUANT),
+        torch_dtype=torch.bfloat16,
+    )
+    # torchao-веса нельзя сериализовать в safetensors (tensor-subclass) → обычный формат
+    transformer.save_pretrained(cache_dir, safe_serialization=False)
+    return transformer
+
+
+def _load_wan_pipe(pipe_cls, model_id, cache_prefix):
+    """Собирает Wan-пайплайн. При USE_FP8 подставляет fp8-трансформеры из кэша."""
+    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=_vae_dtype())
+
+    if USE_FP8:
+        transformer = _load_fp8_transformer(model_id, "transformer", f"{cache_prefix}_high")
+        transformer_2 = _load_fp8_transformer(model_id, "transformer_2", f"{cache_prefix}_low")
+        return pipe_cls.from_pretrained(
+            model_id, transformer=transformer, transformer_2=transformer_2,
+            vae=vae, torch_dtype=torch.bfloat16,
+        )
+
+    return pipe_cls.from_pretrained(model_id, vae=vae, torch_dtype=torch.bfloat16)
+
+
+def _setup_wan_lora(pipe, lora_high_name, lora_low_name):
+    """LoRA-ускоритель (4 шага) поверх базы + планировщик + оффлоад.
+
+    LoRA вешаем СВЕРХУ (как LoraLoaderModelOnly у ComfyUI): high→transformer,
+    low→transformer_2. При USE_FP8 fp8-эксперт (~14 ГБ) влезает в VRAM целиком,
+    поэтому model_cpu_offload свопает эксперты по одному, а не стримит послойно.
+    """
+    pipe.load_lora_weights("lightx2v/Wan2.2-Lightning", weight_name=lora_high_name, adapter_name="high")
+    pipe.load_lora_weights("lightx2v/Wan2.2-Lightning", weight_name=lora_low_name, adapter_name="low")
+    pipe.set_adapters(["high"])
+    pipe.transformer_2.set_adapters(["low"])
+
+    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
+
+    if USE_FP8:
+        pipe.enable_model_cpu_offload()       # своп экспертов, не послойный стриминг
+    else:
+        pipe.enable_sequential_cpu_offload()  # bf16 не влезает → послойный оффлоад
+
+
 def _build_t2v_pipe():
     MODEL_ID = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
-    USE_ACCELERATOR_LORA = True  # False = медленнее, но без LoRA
 
-    vae = AutoencoderKLWan.from_pretrained(MODEL_ID, subfolder="vae", torch_dtype=torch.float32)
-    pipe = WanPipeline.from_pretrained(MODEL_ID, vae=vae, torch_dtype=torch.bfloat16)
-
-    if USE_ACCELERATOR_LORA:
-        # LoRA грузится ОТДЕЛЬНО на high-noise (pipe.transformer) и low-noise (pipe.transformer_2)
-        pipe.load_lora_weights(
-            "lightx2v/Wan2.2-Lightning",
-            weight_name="Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
-            adapter_name="high",
-        )
-        pipe.load_lora_weights(
-            "lightx2v/Wan2.2-Lightning",
-            weight_name="Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors",
-            adapter_name="low",
-        )
-        pipe.set_adapters(["high"])
-        pipe.transformer_2.set_adapters(["low"])
-
-        pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
-        meta = {"num_steps": 4, "guidance": 1.0, "guidance_2": 1.0}
-    else:
-        pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
-        meta = {"num_steps": 40, "guidance": 4.0, "guidance_2": 3.0}
-
-    # Критично для 24 ГБ: выгружаем неактивные части на CPU по мере необходимости
-    pipe.enable_sequential_cpu_offload()
-    return pipe, meta
+    pipe = _load_wan_pipe(WanPipeline, MODEL_ID, "wan_t2v")
+    _setup_wan_lora(
+        pipe,
+        "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
+        "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors",
+    )
+    return pipe, {"num_steps": 4, "guidance": 1.0, "guidance_2": 1.0}
 
 
 def _build_i2v_pipe():
     MODEL_ID = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
-    USE_ACCELERATOR_LORA = True
 
-    vae = AutoencoderKLWan.from_pretrained(MODEL_ID, subfolder="vae", torch_dtype=torch.float32)
-    pipe = WanImageToVideoPipeline.from_pretrained(MODEL_ID, vae=vae, torch_dtype=torch.bfloat16)
-
-    if USE_ACCELERATOR_LORA:
-        # ВНИМАНИЕ: проверь точные имена I2V-весов в репо lightx2v/Wan2.2-Lightning
-        pipe.load_lora_weights(
-            "lightx2v/Wan2.2-Lightning",
-            weight_name="Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
-            adapter_name="high",
-        )
-        pipe.load_lora_weights(
-            "lightx2v/Wan2.2-Lightning",
-            weight_name="Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors",
-            adapter_name="low",
-        )
-        pipe.set_adapters(["high"])
-        pipe.transformer_2.set_adapters(["low"])
-
-        pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
-        meta = {"num_steps": 4, "guidance": 1.0, "guidance_2": 1.0}
-    else:
-        pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
-        meta = {"num_steps": 40, "guidance": 3.5, "guidance_2": 3.5}
-
-    pipe.enable_sequential_cpu_offload()
-    return pipe, meta
+    pipe = _load_wan_pipe(WanImageToVideoPipeline, MODEL_ID, "wan_i2v")
+    # ВНИМАНИЕ: проверь точные имена I2V-весов в репо lightx2v/Wan2.2-Lightning
+    _setup_wan_lora(
+        pipe,
+        "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
+        "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors",
+    )
+    return pipe, {"num_steps": 4, "guidance": 1.0, "guidance_2": 1.0}
 
 
 def _build_image_pipe():
