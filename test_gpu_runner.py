@@ -67,3 +67,19 @@ def test_stop_terminates_process():
     runner.stop()
     runner.proc.join(timeout=5)
     assert not runner.proc.is_alive()
+
+
+def test_recycle_replaces_process_with_fresh_one():
+    # жёсткий сброс VRAM: старый процесс убит, новый обслуживает запросы
+    runner = GpuRunner(echo_worker, poll_timeout=0.5)
+    try:
+        assert runner.submit_and_wait({"id": "1", "data": "a"}) == {"echo": "a"}
+        old_pid = runner.proc.pid
+
+        runner.recycle()
+        assert runner.proc.pid != old_pid       # это уже другой процесс
+        assert runner.proc.is_alive()
+
+        assert runner.submit_and_wait({"id": "2", "data": "b"}) == {"echo": "b"}
+    finally:
+        _shutdown(runner)

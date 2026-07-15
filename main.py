@@ -80,29 +80,22 @@ VIDEO_TYPES = (ProcessType.T2V, ProcessType.I2V)
 #    НЕ вытесняя видео-модель.
 # ==========================================================================
 
-_video_slot = {"type": None, "pipe": None, "meta": None}
+_slot = {"type": None, "pipe": None, "meta": None}
 
 
-def _get_video_pipe(ptype, builder):
-    """Резидентный видео-слот. Перезагрузка только при смене t2v<->i2v."""
-    if _video_slot["type"] != ptype:
-        if _video_slot["pipe"] is not None:
-            print(f"[gpu] swap video model {_video_slot['type']} -> {ptype}", flush=True)
-        # выгружаем прежнюю видео-модель (обе ~50 ГБ, одновременно не держим)
-        _video_slot["type"] = None
-        _video_slot["pipe"] = None
-        _video_slot["meta"] = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+def _get_pipe(ptype, builder):
+    """Кэш модели в рамках одного процесса. ВНУТРИ процесса модель не выгружаем:
+    VRAM надёжно освобождается только смертью процесса, поэтому при смене модели
+    host пересоздаёт процесс (gpu.recycle()). Сюда попадаем на первой задаче
+    свежего процесса, дальше однотипные запросы переиспользуют тёплую модель."""
+    if _slot["type"] != ptype:
         t0 = time.time()
         pipe, meta = builder()
-        _video_slot["type"] = ptype
-        _video_slot["pipe"] = pipe
-        _video_slot["meta"] = meta
+        _slot["type"] = ptype
+        _slot["pipe"] = pipe
+        _slot["meta"] = meta
         print(f"[{ptype.value}] load: {time.time() - t0:.1f}s", flush=True)
-    return _video_slot["pipe"], _video_slot["meta"]
+    return _slot["pipe"], _slot["meta"]
 
 
 def _build_t2v_pipe():
@@ -199,7 +192,7 @@ def _free_cuda():
 
 
 def _run_t2v(data):
-    pipe, meta = _get_video_pipe(ProcessType.T2V, _build_t2v_pipe)
+    pipe, meta = _get_pipe(ProcessType.T2V, _build_t2v_pipe)
 
     t_inf = time.time()
     video = pipe(
@@ -214,15 +207,13 @@ def _run_t2v(data):
     ).frames[0]
     print(f"[t2v] inference: {time.time() - t_inf:.1f}s", flush=True)
 
-    out = _video_to_bytes(video, data.fps)
-    _free_cuda()  # освобождаем VRAM под возможные картинку/аудио (веса видео остаются в RAM)
-    return out
+    return _video_to_bytes(video, data.fps)
 
 
 def _run_i2v(data):
     from PIL import Image
 
-    pipe, meta = _get_video_pipe(ProcessType.I2V, _build_i2v_pipe)
+    pipe, meta = _get_pipe(ProcessType.I2V, _build_i2v_pipe)
 
     image = Image.open(BytesIO(data["image"])).convert("RGB")
 
@@ -240,28 +231,22 @@ def _run_i2v(data):
     ).frames[0]
     print(f"[i2v] inference: {time.time() - t_inf:.1f}s", flush=True)
 
-    out = _video_to_bytes(video, data["fps"])
-    _free_cuda()
-    return out
+    return _video_to_bytes(video, data["fps"])
 
 
 def _run_image(data):
-    # Транзиентно: грузим на время запроса и освобождаем, видео-слот не трогаем
-    pipe, _ = _build_image_pipe()
-    try:
-        image = pipe(
-            prompt=data.prompt,
-            height=896,
-            width=1152,
-            num_inference_steps=9,  # This actually results in 8 DiT forwards
-            guidance_scale=0.0,     # Guidance should be 0 for the Turbo models
-            generator=torch.Generator("cuda").manual_seed(
-                random.randint(0, sys.maxsize)),
-        ).images[0]
-        return image  # PIL.Image — в base64/PNG превращает host-сторона
-    finally:
-        del pipe
-        _free_cuda()
+    pipe, _ = _get_pipe(ProcessType.IMAGE_GENERATION, _build_image_pipe)
+
+    image = pipe(
+        prompt=data.prompt,
+        height=896,
+        width=1152,
+        num_inference_steps=9,  # This actually results in 8 DiT forwards
+        guidance_scale=0.0,     # Guidance should be 0 for the Turbo models
+        generator=torch.Generator("cuda").manual_seed(
+            random.randint(0, sys.maxsize)),
+    ).images[0]
+    return image  # PIL.Image — в base64/PNG превращает host-сторона
 
 
 def _run_transcription(data):
@@ -374,6 +359,8 @@ scheduler = Scheduler(
 def worker(results, lock, gpu):
     print("Worker started", flush=True)
 
+    loaded = None   # какая модель сейчас в GPU-процессе (по типу задачи)
+
     while True:
         job = scheduler.next_job()
         if job is None:  # остановка
@@ -382,6 +369,13 @@ def worker(results, lock, gpu):
         id = job.get("id")
         type = job.get("type")
         data = job.get("data")
+
+        # Смена модели → жёсткий сброс VRAM смертью процесса (на 24 ГБ иначе OOM:
+        # CUDA не отдаёт «хвост» внутри живого процесса). Однотипные задачи подряд
+        # идут по тёплой модели без пересоздания.
+        if loaded is not None and type != loaded:
+            gpu.recycle()
+        loaded = type
 
         with lock:
             results[id] = {"status": Status.IN_PROGRESS}

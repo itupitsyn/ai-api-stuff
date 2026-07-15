@@ -47,6 +47,24 @@ class GpuRunner:
                     self._start()  # поднимаем заново для следующих задач
                     return {"error": f"generation process died (exitcode={code})"}
 
+    def recycle(self):
+        """Жёсткий сброс VRAM: убить процесс (CUDA-контекст уничтожается вместе с
+        ним) и поднять заново. Единственный надёжный способ полностью вернуть VRAM
+        — внутри живого процесса CUDA оставляет «хвост», который empty_cache() не
+        отдаёт. Вызывается при смене модели."""
+        self._kill()
+        self._start()
+
+    def _kill(self, timeout=10):
+        if self.proc is None:
+            return
+        if self.proc.is_alive():
+            self.proc.terminate()               # SIGTERM
+            self.proc.join(timeout=timeout)
+            if self.proc.is_alive():
+                self.proc.kill()                # SIGKILL, если не завершился
+                self.proc.join(timeout=timeout)
+
     def stop(self):
         try:
             self.job_q.put("BREAK")
