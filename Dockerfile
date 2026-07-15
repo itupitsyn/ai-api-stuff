@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip3 install -r requirements.txt
 
-COPY .env main.py ./
+COPY .env main.py scheduler.py gpu_runner.py ./
 
 ENV PYTHONUNBUFFERED=1
 

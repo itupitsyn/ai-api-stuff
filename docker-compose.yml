@@ -34,6 +34,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=0 # Явно укажем переменную окружения
       - NVIDIA_DRIVER_CAPABILITIES=all
       - PYTHONUNBUFFERED=1
+      - HF_TOKEN=${HF_API_KEY} # берётся из .env в корне — снимает rate-limit при холодной закачке весов
 
     ports:
       - 8000:8000
