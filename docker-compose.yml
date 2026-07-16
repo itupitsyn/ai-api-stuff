@@ -35,15 +35,58 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=all
       - PYTHONUNBUFFERED=1
       - HF_TOKEN=${HF_API_KEY} # берётся из .env в корне — снимает rate-limit при холодной закачке весов
+      - COMFYUI_URL=http://comfyui:8188 # куда слать видео-воркфлоу
 
     ports:
       - 8000:8000
-    
+
     volumes:
       - .:/root
-  
+
+    depends_on:
+      - comfyui
+
     command: ["fastapi", "run", "main.py", "--port", "8000", "--no-reload"]
 
     restart: unless-stopped
 
     # <<: *default-logging
+
+  # ------------------------------------------------------------------------
+  # ComfyUI — мотор видео-генерации (fp8_scaled). Делит GPU 0 с ai-api-stuff;
+  # наш воркер шлёт сюда воркфлоу и дёргает /free на границах, чтобы отдавать
+  # VRAM под картинки/аудио. Порт наружу не обязателен (общаемся по сети compose).
+  # ------------------------------------------------------------------------
+  comfyui:
+    build:
+      context: ./comfyui
+      dockerfile: Dockerfile
+    container_name: comfyui
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']          # та же карта, что у ai-api-stuff
+              capabilities: [gpu, utility, compute]
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=all
+
+    volumes:
+      # модели качаются скриптом comfyui/download_models.sh в ./comfyui/models/
+      - ./comfyui/models:/opt/ComfyUI/models
+      - ./comfyui/output:/opt/ComfyUI/output
+
+    # порт наружу не обязателен (общаемся по сети compose); раскомментируй для веб-UI:
+    # ports:
+    #   - 8188:8188
+
+    restart: unless-stopped

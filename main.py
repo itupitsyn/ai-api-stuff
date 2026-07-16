@@ -33,6 +33,7 @@ from huggingface_hub.utils import http_backoff
 
 from scheduler import Scheduler
 from gpu_runner import GpuRunner
+from comfy_client import ComfyClient, build_t2v_workflow, build_i2v_workflow, load_template
 
 # Магия: перехватываем вызовы к HF и перенаправляем старый аргумент в новый
 original_hf_hub_download = huggingface_hub.hf_hub_download
@@ -75,9 +76,13 @@ NEG_PROMPT = (
 # вместе не влезают). Картинки/аудио грузятся транзиентно и слот не трогают.
 VIDEO_TYPES = (ProcessType.T2V, ProcessType.I2V)
 
+# Видео гоним через ComfyUI (fp8_scaled, качество лучше nf4, offload/VRAM разруливает
+# сам ComfyUI через /free). False → видео на diffusers (путь USE_FP8 ниже, откат на nf4).
+USE_COMFYUI = True
+
 # Квантизация трансформеров Wan через bitsandbytes (4-бит NF4): ~7 ГБ/эксперт, оба
 # влезают в 24 ГБ. В отличие от torchao у bnb штатно работают save/load (быстрый
-# холодный старт из кэша) и LoRA (QLoRA). False = рабочий bf16-путь.
+# холодный старт из кэша) и LoRA (QLoRA). Актуально только при USE_COMFYUI=False.
 USE_FP8 = True
 
 # Wan VAE в fp32 стабильнее (меньше артефактов), но декод медленнее и жрёт память.
@@ -428,11 +433,34 @@ scheduler = Scheduler(
     max_videos_before_cheap=MAX_VIDEOS_BEFORE_CHEAP,
 )
 
+comfy = ComfyClient()   # HTTP-клиент ComfyUI (соединение только при первом запросе)
+_comfy_templates = {}
+
+
+def _comfy_template(kind):
+    if kind not in _comfy_templates:
+        _comfy_templates[kind] = load_template(kind)
+    return _comfy_templates[kind]
+
+
+def _run_video_comfy(ptype, data):
+    """Гонит видео через ComfyUI: подставляет параметры в воркфлоу → run → mp4 bytes."""
+    if ptype == ProcessType.T2V:
+        wf = build_t2v_workflow(_comfy_template("t2v"), prompt=data.prompt,
+                                width=data.width, height=data.height, fps=data.fps)
+    else:  # I2V — сперва загрузить стартовую картинку в ComfyUI
+        image_name = comfy.upload_image(data["image"])
+        wf = build_i2v_workflow(_comfy_template("i2v"), prompt=data["prompt"],
+                                image_name=image_name, width=data["width"],
+                                height=data["height"], fps=data["fps"])
+    return comfy.run(wf)
+
 
 def worker(results, lock, gpu):
     print("Worker started", flush=True)
 
-    loaded = None   # какая модель сейчас в GPU-процессе (по типу задачи)
+    loaded = None    # ProcessType в diffusers-процессе (для recycle при смене модели)
+    backend = None   # "comfy" | "diffusers" — кто последним держал VRAM
 
     while True:
         job = scheduler.next_job()
@@ -443,15 +471,36 @@ def worker(results, lock, gpu):
         type = job.get("type")
         data = job.get("data")
 
-        # Смена модели → жёсткий сброс VRAM смертью процесса (на 24 ГБ иначе OOM:
-        # CUDA не отдаёт «хвост» внутри живого процесса). Однотипные задачи подряд
-        # идут по тёплой модели без пересоздания.
-        if loaded is not None and type != loaded:
+        job_backend = "comfy" if (type in VIDEO_TYPES and USE_COMFYUI) else "diffusers"
+
+        # На границе бэкендов освобождаем VRAM у того, кто её держал (одна карта):
+        # comfy→diffusers — просим ComfyUI выгрузить (/free); diffusers→comfy —
+        # убиваем diffusers-процесс (recycle), чтобы отдать VRAM ComfyUI.
+        if backend == "comfy" and job_backend == "diffusers":
+            comfy.free()
+        elif backend == "diffusers" and job_backend == "comfy":
             gpu.recycle()
-        loaded = type
+            loaded = None
+        backend = job_backend
 
         with lock:
             results[id] = {"status": Status.IN_PROGRESS}
+
+        # --- видео через ComfyUI (host-сторона, без diffusers-процесса) ---
+        if job_backend == "comfy":
+            try:
+                res = _run_video_comfy(type, data)
+                with lock:
+                    results[id] = {"status": Status.DONE, "data": base64.b64encode(res)}
+            except Exception as e:
+                with lock:
+                    results[id] = {"status": Status.ERROR, "data": str(e)}
+            continue
+
+        # --- diffusers-бэкенд: смена модели внутри процесса → жёсткий сброс VRAM ---
+        if loaded is not None and type != loaded:
+            gpu.recycle()
+        loaded = type
 
         if type == ProcessType.TRANSCRIPTION:
             filename = data.get("filename")
@@ -480,7 +529,7 @@ def worker(results, lock, gpu):
                     results[id] = {"status": Status.DONE,
                                    "data": base64.b64encode(filtered_image.read())}
 
-        else:  # T2V / I2V
+        else:  # T2V / I2V на diffusers (USE_COMFYUI=False, откат на nf4)
             res = gpu.submit_and_wait(job)
             if isinstance(res, dict):  # {"error": ...}
                 with lock:

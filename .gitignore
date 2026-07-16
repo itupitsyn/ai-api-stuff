@@ -5,3 +5,7 @@ files
 .config
 .cache
 __pycache__
+comfyui/models
+comfyui/output
+.pytest_cache
+.claude

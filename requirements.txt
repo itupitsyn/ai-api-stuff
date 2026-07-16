@@ -12,7 +12,8 @@ fastapi[standard]
 transformers
 whisperx
 dotenv
-bitsandbytes  # int8-квантизация Wan: штатные save/load + LoRA (QLoRA) + int8-ядра Ampere
+bitsandbytes  # nf4-квантизация Wan для diffusers-отката (USE_COMFYUI=False)
+requests  # HTTP-клиент к ComfyUI
 imageio
 imageio-ffmpeg
 git+https://github.com/huggingface/diffusers
