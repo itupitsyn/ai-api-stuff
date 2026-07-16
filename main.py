@@ -12,7 +12,7 @@ import time
 import gc
 import traceback
 
-from diffusers import ZImagePipeline, WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline, UniPCMultistepScheduler, WanTransformer3DModel, TorchAoConfig
+from diffusers import ZImagePipeline, WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline, UniPCMultistepScheduler, WanTransformer3DModel, BitsAndBytesConfig
 from diffusers.utils import export_to_video, load_image
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import Response
@@ -75,15 +75,19 @@ NEG_PROMPT = (
 # вместе не влезают). Картинки/аудио грузятся транзиентно и слот не трогают.
 VIDEO_TYPES = (ProcessType.T2V, ProcessType.I2V)
 
-# fp8-квантизация трансформеров Wan (по образцу ComfyUI): эксперт ужимается
-# ~28→14 ГБ и влезает в VRAM целиком, поэтому model_cpu_offload свопает эксперты
-# по одному, а не стримит веса послойно (как sequential). Это и есть тот 4x на
-# инференсе (~300с → ~100с по цифрам ComfyUI). False = рабочий bf16-путь.
+# Квантизация трансформеров Wan через bitsandbytes (4-бит NF4): ~7 ГБ/эксперт, оба
+# влезают в 24 ГБ. В отличие от torchao у bnb штатно работают save/load (быстрый
+# холодный старт из кэша) и LoRA (QLoRA). False = рабочий bf16-путь.
 USE_FP8 = True
 
 # Wan VAE в fp32 стабильнее (меньше артефактов), но декод медленнее и жрёт память.
 # ComfyUI гоняет VAE в bf16. Ставим False ради скорости — верни True, если видео поплывёт.
 VAE_FP32 = False
+
+# Куда кэшировать квантованные веса. Первый раз: bf16 → квант → save_pretrained
+# (медленно). Дальше КАЖДАЯ загрузка (в т.ч. после recycle) читает готовый nf4 отсюда
+# — быстро, без повторной квантизации. bnb save/load работает штатно (не как torchao).
+QUANT_CACHE_DIR = os.getenv("QUANT_CACHE_DIR", os.path.expanduser("~/.cache/wan_nf4"))
 
 
 # ==========================================================================
@@ -139,36 +143,45 @@ def _vae_of(model_id):
     return AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=_vae_dtype())
 
 
-def _fp8_quant_config():
-    # diffusers ждёт объект torchao AOBaseConfig. Weight-only fp8: веса в fp8,
-    # матмул в bf16 — работает и на Ampere (3090), и на Ada (4090).
-    from torchao.quantization import Float8WeightOnlyConfig
-    return TorchAoConfig(Float8WeightOnlyConfig())
+def _quant_config():
+    # bitsandbytes 4-бит NF4: ~7 ГБ/эксперт (оба = 14 ГБ влезают в 24 ГБ — нет OOM
+    # при квантизации/загрузке, оффлоадится лучше 8-бита). Компьют в bf16.
+    # 8-бит не подошёл: ~14 ГБ/эксперт, два не влезают, а bnb квантует на GPU.
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
 
 
-def _quantize_transformer(model_id, subfolder):
-    """fp8-квантованный трансформер (свежая квантизация через TorchAoConfig).
+def _quantize_transformer(model_id, subfolder, cache_dir):
+    """int8-квантованный трансформер с дисковым кэшом (bnb save/load работает штатно).
 
-    БЕЗ дискового кэша: роундтрип квантованной модели в этом стеке принципиально
-    сломан — save_pretrained шардит без индекса, torch.save(module) не пиклит
-    (torchao патчит forward через functools.partial), а from_config+assign теряет
-    метаданные квантизации (hf_quantizer), из-за чего падает инъекция LoRA
-    (TorchaoLoraLinear ... missing get_apply_tensor_subclass). Только свежая
-    квантизация даёт полностью рабочую модель (LoRA + offload на GPU).
+    Кэш есть → from_pretrained(cache) грузит готовый int8 (конфиг квантизации лежит
+    в его config.json, метаданные на месте → LoRA и offload работают). Нет → квантуем
+    bnb на лету и save_pretrained. LoRA вешаем поверх в _build_wan_fp8.
     """
-    print(f"[fp8] quantize {model_id.split('/')[-1]}/{subfolder}", flush=True)
-    return WanTransformer3DModel.from_pretrained(
+    if os.path.isdir(cache_dir):
+        print(f"[quant] load cached {os.path.basename(cache_dir)}", flush=True)
+        return WanTransformer3DModel.from_pretrained(cache_dir, torch_dtype=torch.bfloat16)
+
+    print(f"[quant] quantize+cache {os.path.basename(cache_dir)} (one-time)", flush=True)
+    t = WanTransformer3DModel.from_pretrained(
         model_id, subfolder=subfolder,
-        quantization_config=_fp8_quant_config(), torch_dtype=torch.bfloat16)
+        quantization_config=_quant_config(), torch_dtype=torch.bfloat16)
+    t.save_pretrained(cache_dir)
+    return t
 
 
 def _build_wan_fp8(kind):
-    """fp8-путь: свежеквантованные трансформеры + LoRA поверх + model_cpu_offload.
-    На torch 2.11 / torchao 0.17 diffusers знает про квантизацию, поэтому offload
-    корректно двигает fp8-веса на GPU (а не оставляет на CPU)."""
+    """int8-путь (bnb): квантованные трансформеры (из кэша или на лету) + LoRA поверх
+    + model_cpu_offload. bnb хранит метаданные квантизации в чекпойнте, поэтому и
+    LoRA (QLoRA), и offload на GPU работают."""
     m = WAN_MODELS[kind]
-    transformer = _quantize_transformer(m["model_id"], "transformer")
-    transformer_2 = _quantize_transformer(m["model_id"], "transformer_2")
+    high_dir = os.path.join(QUANT_CACHE_DIR, f"wan_{kind}_transformer")
+    low_dir = os.path.join(QUANT_CACHE_DIR, f"wan_{kind}_transformer_2")
+    transformer = _quantize_transformer(m["model_id"], "transformer", high_dir)
+    transformer_2 = _quantize_transformer(m["model_id"], "transformer_2", low_dir)
 
     pipe = m["pipe_cls"].from_pretrained(
         m["model_id"], transformer=transformer, transformer_2=transformer_2,

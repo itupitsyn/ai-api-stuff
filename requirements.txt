@@ -12,7 +12,7 @@ fastapi[standard]
 transformers
 whisperx
 dotenv
-torchao==0.17.0  # совместим с torch 2.11; включает diffusers-нативный fp8 (TorchAoConfig + LoRA-on-quantized + offload)
+bitsandbytes  # int8-квантизация Wan: штатные save/load + LoRA (QLoRA) + int8-ядра Ampere
 imageio
 imageio-ffmpeg
 git+https://github.com/huggingface/diffusers
