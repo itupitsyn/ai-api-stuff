@@ -86,7 +86,7 @@ services:
       - ./comfyui/output:/opt/ComfyUI/output
 
     # порт наружу не обязателен (общаемся по сети compose); раскомментируй для веб-UI:
-    # ports:
-    #   - 8188:8188
+    ports:
+      - 8188:8188
 
     restart: unless-stopped

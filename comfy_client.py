@@ -31,29 +31,48 @@ def _seed(seed):
     return seed if seed is not None else random.randint(0, 2 ** 63 - 1)
 
 
-def build_t2v_workflow(template, *, prompt, width, height, fps, num_frames=81, seed=None):
-    """Подставляет параметры в t2v-граф (ноды: 89 текст, 74 латент, 88 fps, 81 seed)."""
+# Карты подстановки: какой (node_id, field) получает каждый параметр — СВОЯ на модель.
+# Wan-графы из prompts.go. Для LTX добавить LTX_*_MAP с его node ID (см. build_workflow).
+WAN_T2V_MAP = {
+    "prompt": ("89", "text"), "width": ("74", "width"), "height": ("74", "height"),
+    "num_frames": ("74", "length"), "fps": ("88", "fps"), "seed": ("81", "noise_seed"),
+}
+WAN_I2V_MAP = {
+    "prompt": ("93", "text"), "image": ("97", "image"), "width": ("98", "width"),
+    "height": ("98", "height"), "num_frames": ("98", "length"), "fps": ("94", "fps"),
+    "seed": ("86", "noise_seed"),
+}
+
+
+def build_workflow(template, mapping, *, prompt=None, image_name=None, width=None,
+                   height=None, fps=None, num_frames=None, seed=None):
+    """Модель-агностичная подстановка: кладёт значения в ноды по `mapping`.
+
+    mapping — dict {параметр: (node_id, field)}. Задан только для тех параметров,
+    что есть в конкретном графе. Чтобы подключить новую модель (LTX и т.п.) —
+    достаточно её workflow-JSON + такой карты, код менять не надо.
+    """
     wf = copy.deepcopy(template)
-    wf["89"]["inputs"]["text"] = prompt
-    wf["74"]["inputs"]["width"] = width
-    wf["74"]["inputs"]["height"] = height
-    wf["74"]["inputs"]["length"] = num_frames
-    wf["88"]["inputs"]["fps"] = fps
-    wf["81"]["inputs"]["noise_seed"] = _seed(seed)   # high-noise сэмплер (add_noise=enable)
+    values = {
+        "prompt": prompt, "image": image_name, "width": width, "height": height,
+        "fps": fps, "num_frames": num_frames,
+        "seed": _seed(seed) if "seed" in mapping else None,  # None → случайный
+    }
+    for key, value in values.items():
+        if value is not None and key in mapping:
+            node_id, field = mapping[key]
+            wf[node_id]["inputs"][field] = value
     return wf
+
+
+def build_t2v_workflow(template, *, prompt, width, height, fps, num_frames=81, seed=None):
+    return build_workflow(template, WAN_T2V_MAP, prompt=prompt, width=width, height=height,
+                          fps=fps, num_frames=num_frames, seed=seed)
 
 
 def build_i2v_workflow(template, *, prompt, image_name, width, height, fps, num_frames=81, seed=None):
-    """Подставляет параметры в i2v-граф (ноды: 93 текст, 97 картинка, 98 латент, 94 fps, 86 seed)."""
-    wf = copy.deepcopy(template)
-    wf["93"]["inputs"]["text"] = prompt
-    wf["97"]["inputs"]["image"] = image_name
-    wf["98"]["inputs"]["width"] = width
-    wf["98"]["inputs"]["height"] = height
-    wf["98"]["inputs"]["length"] = num_frames
-    wf["94"]["inputs"]["fps"] = fps
-    wf["86"]["inputs"]["noise_seed"] = _seed(seed)
-    return wf
+    return build_workflow(template, WAN_I2V_MAP, prompt=prompt, image_name=image_name,
+                          width=width, height=height, fps=fps, num_frames=num_frames, seed=seed)
 
 
 def find_output_file(history_entry):
