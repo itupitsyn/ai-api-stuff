@@ -32,5 +32,12 @@ RUN for d in ComfyUI-Manager ComfyUI-LTXVideo; do \
 WORKDIR /opt/ComfyUI
 
 EXPOSE 8188
-# --listen 0.0.0.0 — чтобы ai-api-stuff достучался по сети compose
-CMD ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188"]
+# --listen 0.0.0.0 — чтобы ai-api-stuff достучался по сети compose.
+# --disable-pinned-memory — ComfyUI по умолчанию пинит до 90% системной RAM под
+#   оффлоад весов, а пиннутые страницы ядро не может ни выгрузить, ни отобрать:
+#   на длинных клипах H3 (37 ГБ весов) OOM-killer сносит контейнер целиком.
+#   Wan это не ломает — флаг влияет только на способ переброски весов
+#   CPU<->GPU, копии становятся чуть медленнее, результат тот же.
+# --fp16-intermediates — промежуточные тензоры в fp16, экономит VRAM.
+CMD ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188", \
+     "--disable-pinned-memory", "--fp16-intermediates"]

@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from enum import Enum
+from typing import Literal
 
 # whisperx / pyannote / pandas импортируются ЛЕНИВО внутри _run_transcription.
 # Это тяжёлый и капризный аудио-стек (torchcodec/ffmpeg): грузим только когда
@@ -33,7 +34,9 @@ from huggingface_hub.utils import http_backoff
 
 from scheduler import Scheduler
 from gpu_runner import GpuRunner
-from comfy_client import ComfyClient, build_t2v_workflow, build_i2v_workflow, load_template
+from comfy_client import (ComfyClient, MODELS as VIDEO_MODELS, DEFAULT_MODEL,
+                          build_video_workflow, load_template, prepare_image,
+                          template_name)
 
 # Магия: перехватываем вызовы к HF и перенаправляем старый аргумент в новый
 original_hf_hub_download = huggingface_hub.hf_hub_download
@@ -64,7 +67,10 @@ class Item(BaseModel):
     prompt: str
     width: int = 832
     height: int = 480
-    fps: int = 30
+    # fps не задан → берётся дефолт модели (Wan 30, H3 24). У H3 24 fps нативные:
+    # другое значение не ускоряет генерацию, а меняет скорость воспроизведения.
+    fps: int | None = None
+    model: Literal[tuple(VIDEO_MODELS)] = DEFAULT_MODEL
 
 
 NEG_PROMPT = (
@@ -276,7 +282,7 @@ def _run_t2v(data):
     peak = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
     print(f"[t2v] inference: {time.time() - t_inf:.1f}s | peak VRAM {peak:.1f} GB | cuda={torch.cuda.is_available()}", flush=True)
 
-    return _video_to_bytes(video, data.fps)
+    return _video_to_bytes(video, data.fps or VIDEO_MODELS["wan"]["fps"])
 
 
 def _run_i2v(data):
@@ -303,7 +309,7 @@ def _run_i2v(data):
     peak = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
     print(f"[i2v] inference: {time.time() - t_inf:.1f}s | peak VRAM {peak:.1f} GB | cuda={torch.cuda.is_available()}", flush=True)
 
-    return _video_to_bytes(video, data["fps"])
+    return _video_to_bytes(video, data.get("fps") or VIDEO_MODELS["wan"]["fps"])
 
 
 def _run_image(data):
@@ -437,22 +443,28 @@ comfy = ComfyClient()   # HTTP-клиент ComfyUI (соединение тол
 _comfy_templates = {}
 
 
-def _comfy_template(kind):
-    if kind not in _comfy_templates:
-        _comfy_templates[kind] = load_template(kind)
-    return _comfy_templates[kind]
+def _comfy_template(name):
+    if name not in _comfy_templates:
+        _comfy_templates[name] = load_template(name)
+    return _comfy_templates[name]
 
 
 def _run_video_comfy(ptype, data):
     """Гонит видео через ComfyUI: подставляет параметры в воркфлоу → run → mp4 bytes."""
-    if ptype == ProcessType.T2V:
-        wf = build_t2v_workflow(_comfy_template("t2v"), prompt=data.prompt,
-                                width=data.width, height=data.height, fps=data.fps)
-    else:  # I2V — сперва загрузить стартовую картинку в ComfyUI
-        image_name = comfy.upload_image(data["image"])
-        wf = build_i2v_workflow(_comfy_template("i2v"), prompt=data["prompt"],
-                                image_name=image_name, width=data["width"],
-                                height=data["height"], fps=data["fps"])
+    kind = "t2v" if ptype == ProcessType.T2V else "i2v"
+    # t2v приходит объектом Item, i2v — dict (там ещё байты картинки из формы)
+    get = (lambda k: getattr(data, k)) if kind == "t2v" else data.get
+
+    model = get("model") or DEFAULT_MODEL
+    image_name = None
+    if kind == "i2v":  # стартовую картинку подогнать под холст и загрузить в ComfyUI
+        image = prepare_image(model, data["image"], get("width"), get("height"))
+        image_name = comfy.upload_image(image)
+
+    wf = build_video_workflow(
+        model, kind, _comfy_template(template_name(model, kind)),
+        prompt=get("prompt"), image_name=image_name,
+        width=get("width"), height=get("height"), fps=get("fps"))
     return comfy.run(wf)
 
 
@@ -472,6 +484,17 @@ def worker(results, lock, gpu):
         data = job.get("data")
 
         job_backend = "comfy" if (type in VIDEO_TYPES and USE_COMFYUI) else "diffusers"
+
+        # diffusers-откат собран только вокруг Wan; H3 живёт исключительно в ComfyUI.
+        # Молча подменить модель нельзя — вернём ошибку, не трогая GPU.
+        if type in VIDEO_TYPES and job_backend == "diffusers":
+            requested = (data.model if type == ProcessType.T2V else data.get("model"))
+            if (requested or DEFAULT_MODEL) != "wan":
+                with lock:
+                    results[id] = {"status": Status.ERROR, "data":
+                                   f"модель '{requested}' работает только через ComfyUI, "
+                                   f"а сейчас USE_COMFYUI=False"}
+                continue
 
         # На границе бэкендов освобождаем VRAM у того, кто её держал (одна карта):
         # comfy→diffusers — просим ComfyUI выгрузить (/free); diffusers→comfy —
@@ -601,7 +624,7 @@ async def transcription(file: UploadFile):
 @app.post("/api/t2v")
 async def t2v(item: Item):
     id = str(uuid.uuid4())
-    print("t2v", id)
+    print("t2v", id, item.model)
     with lock:
         results[id] = {"status": Status.PENDING}
     scheduler.enqueue({"id": id, "type": ProcessType.T2V, "data": item})
@@ -615,18 +638,19 @@ async def i2v(
     prompt: str = Form(...),
     width: int = Form(832),
     height: int = Form(480),
-    fps: int = Form(30),
+    fps: int | None = Form(None),
+    model: Literal[tuple(VIDEO_MODELS)] = Form(DEFAULT_MODEL),
 ):
     id = str(uuid.uuid4())
-    print("i2v", id)
+    print("i2v", id, model)
     image = await file.read()
     with lock:
         results[id] = {"status": Status.PENDING}
     scheduler.enqueue({
         "id": id,
         "type": ProcessType.I2V,
-        "data": {"prompt": prompt, "image": image,
-                 "width": width, "height": height, "fps": fps},
+        "data": {"prompt": prompt, "image": image, "width": width,
+                 "height": height, "fps": fps, "model": model},
     })
 
     return {"id": id}
