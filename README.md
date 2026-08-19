@@ -62,6 +62,37 @@ ComfyMathExpression, PrimitiveFloat) since width/height/length are substituted
 directly. Substitution targets nodes by `class_type`, not by id, so re-exporting
 a template from ComfyUI with different ids is fine.
 
+# Queue state
+
+`GET /api/queue` returns what the box is doing right now. It is read-only —
+unlike `/api/result`, it never consumes anything.
+
+```json
+{
+  "running": {"id": "…", "type": "t2v", "backend": "comfy", "elapsed": 42.1},
+  "pending": [{"id": "…", "type": "img_gen", "waiting": 20.0}],
+  "counts": {"pending": 2, "by_type": {"img_gen": 1, "i2v": 1}, "awaiting_pickup": 1},
+  "scheduler": {"resident_vtype": "t2v", "subtype_streak": 1, "video_streak": 1,
+                "next_id": "…", "limits": {…}},
+  "worker_alive": true
+}
+```
+
+- `pending` is sorted by wait time, which is **not** the service order — the
+  scheduler batches video by subtype to keep the model warm. `scheduler.next_id`
+  is who would actually be served next, computed by the same `pick_job` the
+  worker uses. Job payloads are never included (i2v carries raw image bytes).
+- `elapsed`/`waiting` are seconds. A `running` job whose `elapsed` keeps growing
+  past the usual generation time means ComfyUI or the diffusers process is stuck.
+- `awaiting_pickup` counts finished results nobody has fetched. It only grows if
+  a caller stopped polling `/api/result` — those entries are held in memory until
+  read, so a steadily rising number is a leaking client.
+- `worker_alive: false` with a non-empty queue means the worker thread died and
+  nothing is being drained; the API keeps accepting jobs regardless.
+- `resident_vtype` is the video subtype currently loaded in the video slot, and
+  the two streak counters explain the ordering: `video_streak` hitting
+  `max_videos_before_cheap` lets a waiting image/transcription jump the line.
+
 # Tests
 
 The queue scheduler and the GPU-process wrapper are isolated in `scheduler.py`
@@ -82,6 +113,9 @@ What is covered:
 - `test_gpu_runner.py` — GPU-process mechanics with fake workers: normal
   submit/return, and respawn after a hard process death (OOM/segfault) so a dead
   worker returns a clear error instead of hanging the queue.
+- `Scheduler.snapshot()` behind `/api/queue` — that it consumes nothing and moves
+  no counters, keeps job payloads out, and that its `next_id` matches what
+  `_take()` actually returns.
 
 Not covered (needs the actual GPU box): model loading/offload and inference in
 `main.py`. Verify those with a real run on the server.

@@ -508,6 +508,8 @@ def worker(results, lock, gpu):
 
         with lock:
             results[id] = {"status": Status.IN_PROGRESS}
+            current.update({"id": id, "type": type, "backend": job_backend,
+                            "started": time.time()})
 
         # --- видео через ComfyUI (host-сторона, без diffusers-процесса) ---
         if job_backend == "comfy":
@@ -566,14 +568,22 @@ def worker(results, lock, gpu):
 load_dotenv()
 results = {}
 lock = threading.Lock()
+# Последняя взятая воркером задача — для /api/queue. Специально НЕ чистим по
+# завершении: признак «ещё выполняется» — статус IN_PROGRESS в results, который
+# воркер и так проставляет. Иначе пришлось бы оборачивать всё тело цикла в
+# try/finally ради одного поля.
+current = {}
 gpu = None
+worker_thread = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global gpu
+    global gpu, worker_thread
     gpu = GpuRunner(gpu_worker)
-    threading.Thread(target=worker, args=(results, lock, gpu), daemon=True).start()
+    worker_thread = threading.Thread(target=worker, args=(results, lock, gpu),
+                                     daemon=True)
+    worker_thread.start()
 
     yield
 
@@ -654,6 +664,62 @@ async def i2v(
     })
 
     return {"id": id}
+
+
+@app.get("/api/queue")
+def get_queue():
+    """Текущее состояние очереди: что считается, что ждёт и почему в таком порядке.
+
+    Диагностический эндпойнт, задачи не трогает (в отличие от /api/result,
+    который забирает и удаляет результат).
+    """
+    now = time.time()
+    snap = scheduler.snapshot(now=now)
+
+    with lock:
+        run = dict(current) if current else None
+        # current — последняя ВЗЯТАЯ задача; выполняется она, только пока воркер
+        # не сменил её статус на DONE/ERROR (либо пока результат не забрали)
+        if run and results.get(run["id"], {}).get("status") != Status.IN_PROGRESS:
+            run = None
+        awaiting_pickup = sum(1 for r in results.values()
+                              if r["status"] in (Status.DONE, Status.ERROR))
+
+    by_type = {}
+    for j in snap["pending"]:
+        by_type[j["type"].value] = by_type.get(j["type"].value, 0) + 1
+
+    resident = snap["resident_vtype"]
+    return {
+        "running": {
+            "id": run["id"],
+            "type": run["type"].value,
+            "backend": run["backend"],          # comfy | diffusers
+            "elapsed": round(now - run["started"], 1),
+        } if run else None,
+        # по возрастанию времени постановки; это НЕ порядок обслуживания —
+        # его показывает scheduler.next_id
+        "pending": [
+            {"id": j["id"], "type": j["type"].value, "waiting": round(now - j["ts"], 1)}
+            for j in sorted(snap["pending"], key=lambda j: j["ts"])
+        ],
+        "counts": {
+            "pending": len(snap["pending"]),
+            "by_type": by_type,
+            "awaiting_pickup": awaiting_pickup,  # готовые, за которыми не пришли
+        },
+        "scheduler": {
+            "resident_vtype": resident.value if resident else None,
+            "subtype_streak": snap["subtype_streak"],
+            "video_streak": snap["video_streak"],
+            "next_id": snap["next_id"],
+            "limits": {"max_video_batch": MAX_VIDEO_BATCH,
+                       "max_wait_secs": MAX_WAIT_SECS,
+                       "max_videos_before_cheap": MAX_VIDEOS_BEFORE_CHEAP},
+        },
+        # False при живой очереди = воркер умер, задачи не разгребаются
+        "worker_alive": worker_thread is not None and worker_thread.is_alive(),
+    }
 
 
 @app.get("/api/result")

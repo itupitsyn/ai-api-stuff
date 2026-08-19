@@ -152,3 +152,56 @@ def test_next_job_returns_and_records():
     assert j["type"] == T2V
     assert s.resident_vtype == T2V
     assert s.video_streak == 1
+
+
+# --------------------------------------------------------------------------
+#  snapshot — состояние для /api/queue
+# --------------------------------------------------------------------------
+
+def test_snapshot_empty_queue():
+    s = make_scheduler()
+    snap = s.snapshot(now=100)
+    assert snap["pending"] == []
+    assert snap["next_id"] is None
+    assert snap["resident_vtype"] is None
+
+
+def test_snapshot_lists_pending_without_payload():
+    s = make_scheduler()
+    # payload у i2v — сырые байты картинки, наружу он попасть не должен
+    s.enqueue({"id": "a", "type": I2V, "ts": 1, "data": {"image": b"\xff" * 10}})
+    snap = s.snapshot(now=100)
+    assert snap["pending"] == [{"id": "a", "type": I2V, "ts": 1}]
+
+
+def test_snapshot_does_not_consume_or_record():
+    s = make_scheduler()
+    s.enqueue(job(T2V, 0))
+    s.snapshot(now=100)
+    s.snapshot(now=100)
+    # слепок не должен ни забирать задачу, ни двигать счётчики батчинга
+    assert s.pending_count() == 1
+    assert s.resident_vtype is None and s.video_streak == 0
+    assert s._take(now=100)["id"] == "t2v-0"
+
+
+def test_snapshot_next_id_follows_batching_not_fifo():
+    s = make_scheduler()
+    s.enqueue(job(T2V, 2))
+    s._take(now=100)          # обслужили t2v → слот t2v тёплый
+    s.enqueue(job(I2V, 1))    # ждёт дольше всех
+    s.enqueue(job(T2V, 3))
+    snap = s.snapshot(now=100)
+    oldest = min(snap["pending"], key=lambda j: j["ts"])
+    # i2v ждёт дольше, но следующим пойдёт t2v — его модель уже загружена
+    assert oldest["id"] == "i2v-1"
+    assert snap["next_id"] == "t2v-3"
+    assert snap["resident_vtype"] == T2V and snap["subtype_streak"] == 1
+
+
+def test_snapshot_next_id_matches_take():
+    s = make_scheduler()
+    for j in [job(T2V, 0), job(IMG, 1), job(I2V, 2)]:
+        s.enqueue(j)
+    predicted = s.snapshot(now=100)["next_id"]
+    assert s._take(now=100)["id"] == predicted

@@ -100,6 +100,35 @@ class Scheduler:
             # поэтому resident_vtype/subtype_streak сохраняются (модель тёплая)
             self.video_streak = 0
 
+    def _pick(self, now=None):
+        """Выбор без удаления и без учёта счётчиков (вызывать под ``self._cv``)."""
+        return pick_job(
+            self._pending, self.video_types, self.resident_vtype,
+            self.subtype_streak, self.video_streak,
+            max_video_batch=self.max_video_batch,
+            max_wait_secs=self.max_wait_secs,
+            max_videos_before_cheap=self.max_videos_before_cheap,
+            now=now,
+        )
+
+    def snapshot(self, now=None):
+        """Согласованный слепок состояния для диагностики (``/api/queue``).
+
+        ``data`` задач намеренно не отдаём: у i2v там сырые байты картинки.
+        ``next_id`` — кого :meth:`_take` выбрал бы прямо сейчас; порядок выдачи
+        не FIFO, и по одному списку ожидающих его не восстановить.
+        """
+        with self._cv:
+            nxt = self._pick(now=now) if self._pending else None
+            return {
+                "pending": [{"id": j.get("id"), "type": j["type"], "ts": j["ts"]}
+                            for j in self._pending],
+                "resident_vtype": self.resident_vtype,
+                "subtype_streak": self.subtype_streak,
+                "video_streak": self.video_streak,
+                "next_id": nxt.get("id") if nxt else None,
+            }
+
     def _take(self, now=None):
         """Небл. ядро: выбирает, удаляет и учитывает задачу. None, если пусто.
 
@@ -109,14 +138,7 @@ class Scheduler:
         """
         if not self._pending:
             return None
-        job = pick_job(
-            self._pending, self.video_types, self.resident_vtype,
-            self.subtype_streak, self.video_streak,
-            max_video_batch=self.max_video_batch,
-            max_wait_secs=self.max_wait_secs,
-            max_videos_before_cheap=self.max_videos_before_cheap,
-            now=now,
-        )
+        job = self._pick(now=now)
         self._pending.remove(job)
         self._record(job["type"])
         return job
