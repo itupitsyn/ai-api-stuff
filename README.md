@@ -40,10 +40,19 @@ uploaded untouched.
 Adding a model means one workflow template plus one substitution map in
 `comfy_client.MODELS` — no other code changes.
 
-Weights: `bash comfyui/download_models_h3.sh` (~43 GB). ComfyUI 0.30.0+ required,
-launched with `--disable-pinned-memory` (see the `command:` override in
-docker-compose) — without it ComfyUI pins most of system RAM and the OOM killer
-takes the container down on long clips.
+Weights: `bash comfyui/download_models_h3.sh` (~43 GB). ComfyUI 0.30.0+ required;
+launch flags live in the `command:` override in docker-compose, not in the image
+(the Dockerfile clones ComfyUI at HEAD, so rebuilding to change a flag would also
+change the version).
+
+`--disable-pinned-memory` used to be set there against the OOM killer, which hit
+on long H3 clips. It cost speed: without page-locked memory ComfyUI's async
+weight offloading cannot do asynchronous DMA, so CPU<->GPU copies go through the
+driver's staging buffer and stop overlapping with compute — measured on a slow
+phase: GPU 0%, PCIe idle, one core pegged. Our clips are 124 frames (5 s), far
+from the RAM ceiling, so the flag is gone. If OOM ever returns, cap the pinning
+instead: `--cache-ram 6 32` (the inactive/pin threshold defaults to 100% of
+system RAM).
 
 Templates in `comfy_workflows/` are named `{model}_{kind}[_turbo]_{format}.json`,
 read left to right:

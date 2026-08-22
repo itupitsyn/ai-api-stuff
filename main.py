@@ -86,6 +86,19 @@ VIDEO_TYPES = (ProcessType.T2V, ProcessType.I2V)
 # сам ComfyUI через /free). False → видео на diffusers (путь USE_FP8 ниже, откат на nf4).
 USE_COMFYUI = True
 
+# Держать картиночную модель не целиком в VRAM, а в RAM с помодульной подкачкой.
+# Зачем: резидентная Z-Image берёт пиком 23.2 ГБ из 23.5, поэтому перед каждой
+# картинкой приходится звать comfy.free() — а он стоит следующему видео ~6 минут
+# на перечитывание 40 ГБ весов H3 с диска. Если ужать картинку так, чтобы она
+# помещалась рядом с ComfyUI (--reserve-vram), free() станет не нужен вовсе.
+# Цена — инференс картинки замедлится (веса ездят по PCIe помодульно).
+# Откат: False, и всё возвращается к pipe.to("cuda").
+# Замер 2026-08-22: с offload peak VRAM 12.9 ГБ (вместо 23.2), но инференс
+# 26.2 с вместо 8.9, а картинка целиком 48.5 с вместо 14.1. Смысл появляется
+# только вместе с --reserve-vram 14 у ComfyUI и отказом от comfy.free() —
+# и тогда надо проверять, во что это обойдётся серии видео (сейчас 160 с).
+IMAGE_CPU_OFFLOAD = False
+
 # Квантизация трансформеров Wan через bitsandbytes (4-бит NF4): ~7 ГБ/эксперт, оба
 # влезают в 24 ГБ. В отличие от torchao у bnb штатно работают save/load (быстрый
 # холодный старт из кэша) и LoRA (QLoRA). Актуально только при USE_COMFYUI=False.
@@ -234,14 +247,46 @@ def _build_i2v_pipe():
     return _build_wan("i2v"), dict(WAN_META)
 
 
+def _from_cache_first(cls, model_id, **kwargs):
+    """``from_pretrained``, который сперва пробует строго локальный кэш.
+
+    Без ``local_files_only`` huggingface_hub на КАЖДОЙ загрузке сверяет ревизии —
+    по HEAD-запросу на файл. Когда сеть недоступна, каждый упирается в
+    HF_HUB_ETAG_TIMEOUT, и загрузка давно скачанной модели растягивается на
+    минуты: замеренный случай — Z-Image за 978 с вместо 5.5 с при пустой очереди.
+    Промах кэша (первый запуск, новая модель) штатно уходит в сеть — поэтому
+    именно так, а не через HF_HUB_OFFLINE, который скачивание запрещает вовсе.
+    """
+    try:
+        return cls.from_pretrained(model_id, local_files_only=True, **kwargs)
+    except Exception as e:
+        # Широкий except намеренно: промах кэша прилетает то OSError, то
+        # ValueError в зависимости от версии hub. Цена ошибки — обычная загрузка.
+        print(f"[hf] {model_id} не поднялся из кэша ({type(e).__name__}), качаем",
+              flush=True)
+        return cls.from_pretrained(model_id, **kwargs)
+
+
 def _build_image_pipe():
     # Use bfloat16 for optimal performance on supported GPUs
-    pipe = ZImagePipeline.from_pretrained(
+    # low_cpu_mem_usage=True — дефолт diffusers при установленном accelerate;
+    # стоявший здесь False заставлял сперва собрать пустую модель в RAM, а потом
+    # залить в неё state dict, то есть держать ~20 ГБ лишних и выбивать page cache
+    # (после чего веса H3 перечитывались с диска на 15 МБ/с). На инференс не
+    # влияет — только на загрузку. Если Z-Image когда-то ломался без False,
+    # это вылезет сразу на первой загрузке.
+    pipe = _from_cache_first(
+        ZImagePipeline,
         "Tongyi-MAI/Z-Image-Turbo",
         torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=False,
+        low_cpu_mem_usage=True,
     )
-    pipe.to("cuda")
+    if IMAGE_CPU_OFFLOAD:
+        # accelerate двигает модули по одному; в VRAM живёт самый большой из них
+        # плюс активации — это и покажет "peak VRAM" в логе инференса.
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe.to("cuda")
     return pipe, {}
 
 
@@ -315,6 +360,10 @@ def _run_i2v(data):
 def _run_image(data):
     pipe, _ = _get_pipe(ProcessType.IMAGE_GENERATION, _build_image_pipe)
 
+    t_inf = time.time()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     image = pipe(
         prompt=data.prompt,
         height=896,
@@ -324,6 +373,13 @@ def _run_image(data):
         generator=torch.Generator("cuda").manual_seed(
             random.randint(0, sys.maxsize)),
     ).images[0]
+
+    # 8 шагов Z-Image Turbo на 3090 — единицы секунд. Десятки/сотни секунд при
+    # нормальном peak VRAM = карту делят или троттлит; peak ~0 = инференс уехал
+    # на CPU (VRAM занял ComfyUI, /free не сработал).
+    peak = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+    print(f"[img_gen] inference: {time.time() - t_inf:.1f}s | peak VRAM {peak:.1f} GB "
+          f"| cuda={torch.cuda.is_available()}", flush=True)
     return image  # PIL.Image — в base64/PNG превращает host-сторона
 
 
@@ -432,6 +488,12 @@ MAX_VIDEO_BATCH = 10         # макс. видео-задач одного по
 MAX_WAIT_SECS = 900          # 15 мин: ждущую дольше задачу обслуживаем вне батчинга
 MAX_VIDEOS_BEFORE_CHEAP = 3  # не больше N видео подряд, если ждут картинки/транскрипции
 
+# Сколько VRAM должно освободиться после comfy.free(), прежде чем грузить свою
+# модель. Z-Image берёт пиком 23.2 ГБ из 23.5 доступных, так что ждать «почти всё»
+# бессмысленно — порог отделяет «ComfyUI отпустил» (замер: 23858 МБ) от «ещё
+# держит» (замер: 1217 МБ).
+FREE_VRAM_TARGET_MB = 20000
+
 scheduler = Scheduler(
     VIDEO_TYPES,
     max_video_batch=MAX_VIDEO_BATCH,
@@ -468,6 +530,36 @@ def _run_video_comfy(ptype, data):
     return comfy.run(wf)
 
 
+def _mem_snapshot():
+    """Свободная RAM/своп с точностью до МБ (в контейнере /proc/meminfo — хостовый)."""
+    want = {"MemAvailable", "Cached", "SwapTotal", "SwapFree"}
+    out = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                if k in want:
+                    out[k] = int(v.split()[0]) // 1024
+    except OSError:
+        pass
+    return out
+
+
+def _log_resources(tag):
+    """Сколько было свободно на входе в задачу.
+
+    Без этого медленный прогон неотличим от быстрого задним числом: тайминги
+    показывают, ЧТО тормозило, а этот снимок — почему.
+    """
+    vram = comfy.vram_free_mb()
+    m = _mem_snapshot()
+    swap_used = (m.get("SwapTotal", 0) - m.get("SwapFree", 0)) or 0
+    print(f"[res] {tag} | vram_free {vram if vram is not None else '?'} MB"
+          f" | ram_avail {m.get('MemAvailable', '?')} MB"
+          f" | cached {m.get('Cached', '?')} MB"
+          f" | swap_used {swap_used} MB", flush=True)
+
+
 def worker(results, lock, gpu):
     print("Worker started", flush=True)
 
@@ -499,70 +591,96 @@ def worker(results, lock, gpu):
         # На границе бэкендов освобождаем VRAM у того, кто её держал (одна карта):
         # comfy→diffusers — просим ComfyUI выгрузить (/free); diffusers→comfy —
         # убиваем diffusers-процесс (recycle), чтобы отдать VRAM ComfyUI.
-        if backend == "comfy" and job_backend == "diffusers":
-            comfy.free()
+        # backend=None — воркер только что стартовал и не знает, кто держит VRAM.
+        # ComfyUI живёт в своём контейнере и переживает рестарт API с загруженной
+        # моделью, поэтому перед ЛЮБОЙ первой diffusers-задачей просим его
+        # освободиться. Иначе pipe.to("cuda") падает с CUDA OOM (проверено на
+        # боксе: ComfyUI держал 18.8 ГБ, свободно оставалось 3 МБ).
+        t_sw = time.time()
+        if job_backend == "diffusers" and backend != "diffusers":
+            comfy.free(wait_vram_mb=FREE_VRAM_TARGET_MB)
         elif backend == "diffusers" and job_backend == "comfy":
             gpu.recycle()
             loaded = None
         backend = job_backend
+        switch = time.time() - t_sw
 
-        with lock:
-            results[id] = {"status": Status.IN_PROGRESS}
-            current.update({"id": id, "type": type, "backend": job_backend,
-                            "started": time.time()})
+        # Тайминги на границе задач: сколько задача пролежала в очереди,
+        # сколько стоило переключение бэкенда и сколько заняла целиком.
+        # Расхождение total и inference из логов GPU-процесса = загрузка
+        # модели заново (recycle/free) или ожидание чужой задачи на карте.
+        t_job = time.time()
+        waited = t_job - job.get("ts", t_job)
+        print(f"[worker] start {type.value} {id} | waited {waited:.1f}s"
+              f" | backend {job_backend} | switch {switch:.1f}s", flush=True)
+        _log_resources(f"before {type.value}")
+        try:
+            with lock:
+                results[id] = {"status": Status.IN_PROGRESS}
+                current.update({"id": id, "type": type, "backend": job_backend,
+                                "started": time.time()})
 
-        # --- видео через ComfyUI (host-сторона, без diffusers-процесса) ---
-        if job_backend == "comfy":
-            try:
-                res = _run_video_comfy(type, data)
-                with lock:
-                    results[id] = {"status": Status.DONE, "data": base64.b64encode(res)}
-            except Exception as e:
-                with lock:
-                    results[id] = {"status": Status.ERROR, "data": str(e)}
-            continue
+            # --- видео через ComfyUI (host-сторона, без diffusers-процесса) ---
+            if job_backend == "comfy":
+                try:
+                    res = _run_video_comfy(type, data)
+                    with lock:
+                        results[id] = {"status": Status.DONE, "data": base64.b64encode(res)}
+                except Exception as e:
+                    with lock:
+                        results[id] = {"status": Status.ERROR, "data": str(e)}
+                continue
 
-        # --- diffusers-бэкенд: смена модели внутри процесса → жёсткий сброс VRAM ---
-        if loaded is not None and type != loaded:
-            gpu.recycle()
-        loaded = type
+            # --- diffusers-бэкенд: смена модели внутри процесса → жёсткий сброс VRAM ---
+            if loaded is not None and type != loaded:
+                t_rc = time.time()
+                gpu.recycle()
+                # после recycle модель грузится с нуля: следующий "[<type>] load:"
+                # в логах GPU-процесса — цена этой смены, а не медленный инференс
+                print(f"[worker] recycle {loaded.value}->{type.value}: "
+                      f"{time.time() - t_rc:.1f}s", flush=True)
+            loaded = type
 
-        if type == ProcessType.TRANSCRIPTION:
-            filename = data.get("filename")
-            try:
+            if type == ProcessType.TRANSCRIPTION:
+                filename = data.get("filename")
+                try:
+                    res = gpu.submit_and_wait(job)
+                    if isinstance(res, dict) and res.get("error"):
+                        with lock:
+                            results[id] = {"status": Status.ERROR, "data": res.get("error")}
+                    else:
+                        with lock:
+                            results[id] = {"status": Status.DONE, "data": res}
+                finally:
+                    if filename and os.path.exists(filename):
+                        os.unlink(filename)
+
+            elif type == ProcessType.IMAGE_GENERATION:
                 res = gpu.submit_and_wait(job)
-                if isinstance(res, dict) and res.get("error"):
+                if isinstance(res, dict):  # {"error": ...}
+                    with lock:
+                        results[id] = {"status": Status.ERROR, "data": res.get("error")}
+                else:
+                    filtered_image = BytesIO()
+                    res.save(filtered_image, "PNG")
+                    filtered_image.seek(0)
+                    with lock:
+                        results[id] = {"status": Status.DONE,
+                                       "data": base64.b64encode(filtered_image.read())}
+
+            else:  # T2V / I2V на diffusers (USE_COMFYUI=False, откат на nf4)
+                res = gpu.submit_and_wait(job)
+                if isinstance(res, dict):  # {"error": ...}
                     with lock:
                         results[id] = {"status": Status.ERROR, "data": res.get("error")}
                 else:
                     with lock:
-                        results[id] = {"status": Status.DONE, "data": res}
-            finally:
-                if filename and os.path.exists(filename):
-                    os.unlink(filename)
-
-        elif type == ProcessType.IMAGE_GENERATION:
-            res = gpu.submit_and_wait(job)
-            if isinstance(res, dict):  # {"error": ...}
-                with lock:
-                    results[id] = {"status": Status.ERROR, "data": res.get("error")}
-            else:
-                filtered_image = BytesIO()
-                res.save(filtered_image, "PNG")
-                filtered_image.seek(0)
-                with lock:
-                    results[id] = {"status": Status.DONE,
-                                   "data": base64.b64encode(filtered_image.read())}
-
-        else:  # T2V / I2V на diffusers (USE_COMFYUI=False, откат на nf4)
-            res = gpu.submit_and_wait(job)
-            if isinstance(res, dict):  # {"error": ...}
-                with lock:
-                    results[id] = {"status": Status.ERROR, "data": res.get("error")}
-            else:
-                with lock:
-                    results[id] = {"status": Status.DONE,
-                                   "data": base64.b64encode(res)}
+                        results[id] = {"status": Status.DONE,
+                                       "data": base64.b64encode(res)}
+        finally:
+            print(f"[worker] done  {type.value} {id} |"
+                  f" total {time.time() - t_job:.1f}s", flush=True)
+            _log_resources(f"after  {type.value}")
 
 
 load_dotenv()

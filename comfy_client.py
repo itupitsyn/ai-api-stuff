@@ -333,13 +333,58 @@ class ComfyClient:
         r.raise_for_status()
         return r.content
 
-    def free(self):
-        """Сброс VRAM: модели ComfyUI уходят в RAM, кэш чистится."""
+    def vram_free_mb(self):
+        """Свободная VRAM по данным ComfyUI (МБ). None, если он недоступен.
+
+        Берём отсюда, а не из torch: API-процесс не должен поднимать свой
+        CUDA-контекст ради одной цифры.
+        """
+        try:
+            r = requests.get(f"{self.base}/system_stats", timeout=10)
+            r.raise_for_status()
+            dev = (r.json().get("devices") or [{}])[0]
+            return int(dev.get("vram_free", 0)) // (1024 * 1024)
+        except Exception:
+            return None
+
+    def free(self, wait_vram_mb=0, timeout=60):
+        """Сброс VRAM: модели ComfyUI уходят в RAM, кэш чистится.
+
+        ``/free`` отвечает 200 ДО того, как память реально отдана драйверу.
+        Замер на боксе: сразу после вызова ``vram_free`` было 1217 МБ, и
+        Z-Image (пик 23.2 ГБ) грузился в занятую карту 201 с вместо 20; в другой
+        раз тот же расклад дал CUDA OOM. Поэтому при ``wait_vram_mb`` ждём по
+        факту, а не по коду ответа.
+
+        По истечении ``timeout`` не бросаем исключение, а идём дальше с
+        предупреждением: лучше попытаться и упасть с внятной ошибкой загрузки,
+        чем заблокировать очередь навсегда.
+        """
         try:
             requests.post(f"{self.base}/free",
                           json={"unload_models": True, "free_memory": True}, timeout=30)
         except Exception as e:
             print(f"[comfy] /free failed: {e}", flush=True)
+            return None
+
+        if not wait_vram_mb:
+            return None
+
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            got = self.vram_free_mb()
+            if got is None:      # ComfyUI не отвечает — ждать нечего
+                break
+            if got >= wait_vram_mb:
+                print(f"[comfy] VRAM отдана: {got} MB за {time.time() - t0:.1f}s",
+                      flush=True)
+                return got
+            time.sleep(self.poll_interval)
+
+        got = self.vram_free_mb()
+        print(f"[comfy] ВНИМАНИЕ: за {timeout}s освободилось только {got} MB "
+              f"(ждали {wait_vram_mb}); продолжаем", flush=True)
+        return got
 
     def run(self, workflow):
         """Полный цикл: submit → wait → скачать байты видео."""
