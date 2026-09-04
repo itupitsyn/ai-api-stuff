@@ -345,12 +345,22 @@ def test_rotation_does_not_break_video_batching():
     assert order == [I2V, T2V, T2V, T2V]
 
 
-def test_starvation_guard_beats_user_rotation():
-    # забытая задача важнее круга: её обслуживают вне очереди
+def test_starvation_guard_does_not_break_the_rotation():
+    # Чужая просроченная задача НЕ отменяет круг: иначе при глубокой очереди
+    # просрочены оказываются все разом и справедливость исчезает.
     pending = [job(T2V, 0, user=1), job(T2V, 50, user=2)]
     chosen = pick(pending, current_user=2, user_streak=0, user_order=[2, 1],
                   max_wait_secs=100, now=200)
-    assert chosen["user"] == 1
+    assert chosen["user"] == 2
+
+
+def test_starvation_guard_works_inside_the_user():
+    # А вот забытую задачу самого обслуживаемого человека вытаскивает
+    pending = [job(IMG, 0, user=1), job(T2V, 50, user=1)]
+    chosen = pick(pending, current_user=1, user_streak=0, user_order=[1],
+                  resident_vtype=T2V, subtype_streak=1, video_streak=1,
+                  max_wait_secs=100, now=200)
+    assert chosen["type"] == IMG
 
 
 def test_pick_user_keeps_current_until_quantum_spent():
@@ -404,3 +414,70 @@ def test_snapshot_reports_inflight_per_user():
     s.enqueue(job(T2V, 1, user=1))
     s.enqueue(job(T2V, 2, user=2))
     assert s.snapshot(now=100)["inflight"] == {1: 2, 2: 1}
+
+
+def test_nobody_is_pushed_to_the_end_forever():
+    """Жадные соседи не могут задвинуть чужую задачу дальше одного оборота.
+
+    Голодание тут ловится числом: жертва обязана уехать не дальше позиции
+    (соседей x квант + 1). Правило выбора уже один раз это ломало — глобальный
+    анти-старвейшн при глубокой очереди вырождался в FIFO и отменял круг, и с
+    50 соседями жертва уезжала на 251-ю позицию вместо 101-й. Тест держит
+    границу, чтобы такое не вернулось незаметно.
+    """
+    neighbours, quantum, cap, job_secs = 10, 2, 5, 85.0
+    limit = neighbours * quantum + 1
+
+    s = make_scheduler(max_user_batch=quantum, max_user_inflight=cap,
+                       max_wait_secs=900)
+    now = 0.0
+    counter = 0
+
+    for user in range(1, neighbours + 1):
+        for _ in range(cap):
+            counter += 1
+            s.enqueue({"id": f"g{counter}", "type": T2V, "ts": now, "user": user})
+    s.enqueue({"id": "victim", "type": T2V, "ts": now, "user": 999})
+
+    served = 0
+    while True:
+        j = s._take(now=now)
+        assert j is not None, "очередь опустела, а жертву так и не обслужили"
+        s.finish(j)
+        served += 1
+        now += job_secs
+        if j["id"] == "victim":
+            break
+
+        # сосед немедленно ставит новую задачу взамен досчитанной
+        counter += 1
+        s.enqueue({"id": f"g{counter}", "type": T2V, "ts": now, "user": j["user"]})
+        assert served < limit, f"жертву задвинули за круг: уже {served} задач"
+
+    assert served == limit
+
+
+def test_cheap_job_is_not_pushed_to_the_end_by_video_neighbours():
+    # лёгкая задача среди чужих видео ждёт тот же оборот, не дольше
+    neighbours, quantum, cap = 5, 2, 5
+    s = make_scheduler(max_user_batch=quantum, max_user_inflight=cap)
+    now = 0.0
+    counter = 0
+
+    for user in range(1, neighbours + 1):
+        for _ in range(cap):
+            counter += 1
+            s.enqueue({"id": f"g{counter}", "type": T2V, "ts": now, "user": user})
+    s.enqueue({"id": "victim", "type": IMG, "ts": now, "user": 999})
+
+    served = 0
+    while True:
+        j = s._take(now=now)
+        s.finish(j)
+        served += 1
+        if j["id"] == "victim":
+            break
+        counter += 1
+        s.enqueue({"id": f"g{counter}", "type": T2V, "ts": now, "user": j["user"]})
+
+    assert served <= neighbours * quantum + 1
