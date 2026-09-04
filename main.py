@@ -14,7 +14,7 @@ import traceback
 
 from diffusers import ZImagePipeline, WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline, UniPCMultistepScheduler, WanTransformer3DModel, BitsAndBytesConfig
 from diffusers.utils import export_to_video, load_image
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, HTTPException, UploadFile, Form
 from fastapi.responses import Response
 from io import BytesIO
 from pydantic import BaseModel
@@ -65,6 +65,9 @@ class Status(Enum):
 
 class Item(BaseModel):
     prompt: str
+    # Владелец задачи: по нему считается потолок и строится круг обслуживания.
+    # Не задан — задача попадает к общему анонимному пользователю.
+    user: int | None = None
     width: int = 832
     height: int = 480
     # fps не задан → берётся дефолт модели (Wan 30, H3 24). У H3 24 fps нативные:
@@ -487,6 +490,12 @@ def gpu_worker(job_q, res_q):
 MAX_VIDEO_BATCH = 10         # макс. видео-задач одного подтипа подряд, если ждёт другой тип
 MAX_WAIT_SECS = 900          # 15 мин: ждущую дольше задачу обслуживаем вне батчинга
 MAX_VIDEOS_BEFORE_CHEAP = 3  # не больше N видео подряд, если ждут картинки/транскрипции
+MAX_USER_BATCH = 2           # задач одного человека подряд, пока в очереди есть другие
+MAX_USER_INFLIGHT = 5        # задач одного человека в работе; сверх этого — отказ
+
+# Что говорим, когда у человека уже полно задач. Текст уходит в detail 429;
+# бот показывает свою фразу, а этот нужен людям в логах и при отладке руками.
+QUEUE_FULL_DETAIL = f"уже {MAX_USER_INFLIGHT} задач в работе, дождитесь их"
 
 # Сколько VRAM должно освободиться после comfy.free(), прежде чем грузить свою
 # модель. Z-Image берёт пиком 23.2 ГБ из 23.5 доступных, так что ждать «почти всё»
@@ -499,6 +508,8 @@ scheduler = Scheduler(
     max_video_batch=MAX_VIDEO_BATCH,
     max_wait_secs=MAX_WAIT_SECS,
     max_videos_before_cheap=MAX_VIDEOS_BEFORE_CHEAP,
+    max_user_batch=MAX_USER_BATCH,
+    max_user_inflight=MAX_USER_INFLIGHT,
 )
 
 comfy = ComfyClient()   # HTTP-клиент ComfyUI (соединение только при первом запросе)
@@ -586,6 +597,9 @@ def worker(results, lock, gpu):
                     results[id] = {"status": Status.ERROR, "data":
                                    f"модель '{requested}' работает только через ComfyUI, "
                                    f"а сейчас USE_COMFYUI=False"}
+                # ранний выход мимо try/finally ниже — место в допуске
+                # освобождаем здесь, иначе оно останется занятым навсегда
+                scheduler.finish(job)
                 continue
 
         # На границе бэкендов освобождаем VRAM у того, кто её держал (одна карта):
@@ -618,7 +632,7 @@ def worker(results, lock, gpu):
             with lock:
                 results[id] = {"status": Status.IN_PROGRESS}
                 current.update({"id": id, "type": type, "backend": job_backend,
-                                "started": time.time()})
+                                "user": job.get("user"), "started": time.time()})
 
             # --- видео через ComfyUI (host-сторона, без diffusers-процесса) ---
             if job_backend == "comfy":
@@ -678,6 +692,9 @@ def worker(results, lock, gpu):
                         results[id] = {"status": Status.DONE,
                                        "data": base64.b64encode(res)}
         finally:
+            # задача досчитана (или упала) — освобождаем место под следующую
+            # задачу этого человека
+            scheduler.finish(job)
             print(f"[worker] done  {type.value} {id} |"
                   f" total {time.time() - t_job:.1f}s", flush=True)
             _log_resources(f"after  {type.value}")
@@ -717,19 +734,35 @@ async def root():
     return {"status": "ok"}
 
 
+def enqueue_or_reject(job):
+    """Ставит задачу в очередь либо отвечает 429, если у человека их уже полно.
+
+    Место в ``results`` занимается ДО постановки (иначе воркер успеет перевести
+    задачу в IN_PROGRESS, а мы затрём это обратно в PENDING), поэтому при отказе
+    его надо освободить — задачи-то не будет.
+    """
+    if scheduler.enqueue(job):
+        return
+
+    with lock:
+        results.pop(job["id"], None)
+    raise HTTPException(status_code=429, detail=QUEUE_FULL_DETAIL)
+
+
 @app.post("/api/txt2img")
 async def txt2img(item: Item):
     id = str(uuid.uuid4())
     print("img", id)
     with lock:
         results[id] = {"status": Status.PENDING}
-    scheduler.enqueue({"id": id, "type": ProcessType.IMAGE_GENERATION, "data": item})
+    enqueue_or_reject({"id": id, "type": ProcessType.IMAGE_GENERATION,
+                       "data": item, "user": item.user})
 
     return {"id": id}
 
 
 @app.post("/api/transcription")
-async def transcription(file: UploadFile):
+async def transcription(file: UploadFile, user: int | None = Form(None)):
     if not os.path.exists("files"):
         os.mkdir("files")
 
@@ -743,8 +776,14 @@ async def transcription(file: UploadFile):
 
     with lock:
         results[id] = {"status": Status.PENDING}
-    scheduler.enqueue({"id": id, "type": ProcessType.TRANSCRIPTION,
-             "data": {"filename": filename}})
+    try:
+        enqueue_or_reject({"id": id, "type": ProcessType.TRANSCRIPTION,
+                           "data": {"filename": filename}, "user": user})
+    except HTTPException:
+        # задача не встала — файл убираем за собой, чистить его больше некому
+        if os.path.exists(filename):
+            os.unlink(filename)
+        raise
 
     return {"id": id}
 
@@ -755,7 +794,8 @@ async def t2v(item: Item):
     print("t2v", id, item.model)
     with lock:
         results[id] = {"status": Status.PENDING}
-    scheduler.enqueue({"id": id, "type": ProcessType.T2V, "data": item})
+    enqueue_or_reject({"id": id, "type": ProcessType.T2V,
+                       "data": item, "user": item.user})
 
     return {"id": id}
 
@@ -768,15 +808,17 @@ async def i2v(
     height: int = Form(480),
     fps: int | None = Form(None),
     model: Literal[tuple(VIDEO_MODELS)] = Form(DEFAULT_MODEL),
+    user: int | None = Form(None),
 ):
     id = str(uuid.uuid4())
     print("i2v", id, model)
     image = await file.read()
     with lock:
         results[id] = {"status": Status.PENDING}
-    scheduler.enqueue({
+    enqueue_or_reject({
         "id": id,
         "type": ProcessType.I2V,
+        "user": user,
         "data": {"prompt": prompt, "image": image, "width": width,
                  "height": height, "fps": fps, "model": model},
     })
@@ -813,13 +855,16 @@ def get_queue():
             "id": run["id"],
             "type": run["type"].value,
             "backend": run["backend"],          # comfy | diffusers
+            "user": run.get("user"),
             "elapsed": round(now - run["started"], 1),
         } if run else None,
-        # по возрастанию времени постановки; это НЕ порядок обслуживания —
-        # его показывает scheduler.next_id
+        # В порядке ОБСЛУЖИВАНИЯ, а не постановки: очередь не FIFO — порядок
+        # задают круг по людям и батчинг. Бот по этому списку считает «ты N-й»,
+        # так что хронология тут была бы враньём.
         "pending": [
-            {"id": j["id"], "type": j["type"].value, "waiting": round(now - j["ts"], 1)}
-            for j in sorted(snap["pending"], key=lambda j: j["ts"])
+            {"id": j["id"], "type": j["type"].value, "user": j["user"],
+             "waiting": round(now - j["ts"], 1)}
+            for j in snap["pending"]
         ],
         "counts": {
             "pending": len(snap["pending"]),
@@ -831,9 +876,14 @@ def get_queue():
             "subtype_streak": snap["subtype_streak"],
             "video_streak": snap["video_streak"],
             "next_id": snap["next_id"],
+            "current_user": snap["current_user"],
+            "user_streak": snap["user_streak"],
+            "inflight": snap["inflight"],       # пользователь -> задач в работе
             "limits": {"max_video_batch": MAX_VIDEO_BATCH,
                        "max_wait_secs": MAX_WAIT_SECS,
-                       "max_videos_before_cheap": MAX_VIDEOS_BEFORE_CHEAP},
+                       "max_videos_before_cheap": MAX_VIDEOS_BEFORE_CHEAP,
+                       "max_user_batch": MAX_USER_BATCH,
+                       "max_user_inflight": MAX_USER_INFLIGHT},
         },
         # False при живой очереди = воркер умер, задачи не разгребаются
         "worker_alive": worker_thread is not None and worker_thread.is_alive(),
