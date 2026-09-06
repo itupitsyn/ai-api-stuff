@@ -30,6 +30,15 @@ def dying_worker(job_q, res_q):
         res_q.put((job["id"], {"ok": job["data"]}))
 
 
+def env_worker(job_q, res_q):
+    """Докладывает, какую карту видит потомок."""
+    while True:
+        job = job_q.get()
+        if job == "BREAK":
+            break
+        res_q.put((job["id"], {"visible": os.environ.get("CUDA_VISIBLE_DEVICES")}))
+
+
 def _shutdown(runner):
     runner.stop()
     if runner.proc is not None:
@@ -81,5 +90,46 @@ def test_recycle_replaces_process_with_fresh_one():
         assert runner.proc.is_alive()
 
         assert runner.submit_and_wait({"id": "2", "data": "b"}) == {"echo": "b"}
+    finally:
+        _shutdown(runner)
+
+
+# --- закрепление карты за процессом ---
+
+def test_device_is_pinned_in_the_child():
+    """Потомок видит ровно свою карту: она приходит через окружение до импортов."""
+    runner = GpuRunner(env_worker, device=1, poll_timeout=0.5)
+    try:
+        assert runner.submit_and_wait({"id": "a", "data": None}) == {"visible": "1"}
+    finally:
+        _shutdown(runner)
+
+
+def test_parent_environment_is_restored():
+    """Родителю чужая карта ни к чему — переменная возвращается как была."""
+    before = os.environ.get("CUDA_VISIBLE_DEVICES")
+    runner = GpuRunner(env_worker, device=1, poll_timeout=0.5)
+    try:
+        assert os.environ.get("CUDA_VISIBLE_DEVICES") == before
+    finally:
+        _shutdown(runner)
+
+
+def test_recycle_keeps_the_same_card():
+    """Пересоздание процесса не теряет привязку к карте."""
+    runner = GpuRunner(env_worker, device=1, poll_timeout=0.5)
+    try:
+        runner.recycle()
+        assert runner.submit_and_wait({"id": "a", "data": None}) == {"visible": "1"}
+    finally:
+        _shutdown(runner)
+
+
+def test_without_device_environment_is_not_touched():
+    """Без device окружение не подменяется — однокарточное поведение прежнее."""
+    before = os.environ.get("CUDA_VISIBLE_DEVICES")
+    runner = GpuRunner(env_worker, poll_timeout=0.5)
+    try:
+        assert runner.submit_and_wait({"id": "a", "data": None}) == {"visible": before}
     finally:
         _shutdown(runner)

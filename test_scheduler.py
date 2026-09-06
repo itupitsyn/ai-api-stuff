@@ -23,11 +23,21 @@ def make_scheduler(**kw):
     return Scheduler(VIDEO, **kw)
 
 
-def policy(**kw):
-    """Состояние политики с нужными полями; остальные — по умолчанию."""
+# Поля, которые живут на карте, а не на политике: тёплая модель и счётчики
+# батчинга у каждой карты свои.
+DEVICE_FIELDS = ("resident_vtype", "subtype_streak", "video_streak")
+
+
+def policy(device=None, **kw):
+    """Состояние политики с нужными полями; остальные — по умолчанию.
+
+    Поля из ``DEVICE_FIELDS`` ставятся на карту ``device`` (в большинстве
+    тестов она одна и зовётся None), остальные — на саму политику.
+    """
     p = Policy()
+    dev = p.device(device)
     for name, value in kw.items():
-        setattr(p, name, value)
+        setattr(dev if name in DEVICE_FIELDS else p, name, value)
     return p
 
 
@@ -481,3 +491,117 @@ def test_cheap_job_is_not_pushed_to_the_end_by_video_neighbours():
         s.enqueue({"id": f"g{counter}", "type": T2V, "ts": now, "user": j["user"]})
 
     assert served <= neighbours * quantum + 1
+
+
+# --------------------------------------------------------------------------
+#  Пул карт: своя тёплая модель у каждой, общий круг, общий потолок видео
+# --------------------------------------------------------------------------
+def test_devices_keep_their_own_warm_model():
+    """Тёплая модель своя у каждой карты: батч на одной не двигает выбор другой."""
+    s = make_scheduler(devices=("a", "b"))
+    for jtype, ts in ((T2V, 1), (I2V, 2), (T2V, 3), (I2V, 4)):
+        s.enqueue(job(jtype, ts))
+
+    assert s._take(now=100, device="a")["id"] == "t2v-1"   # старейшая
+    assert s.policy.device("a").resident_vtype == T2V
+    assert s.policy.device("b").resident_vtype is None     # соседке ничего не досталось
+
+    # у b тёплого нет — берёт просто старейшую из оставшихся
+    assert s._take(now=100, device="b")["id"] == "i2v-2"
+    assert s.policy.device("b").resident_vtype == I2V
+
+    # а вот a добивает СВОЙ тёплый подтип, а не старейшую задачу
+    assert s._take(now=100, device="a")["id"] == "t2v-3"
+
+
+def test_specialization_emerges_without_being_hardcoded():
+    """Видео липнет к прогретой карте, картинки уходят на соседнюю — само."""
+    s = make_scheduler(devices=("a", "b"))
+    for jtype, ts in ((T2V, 1), (IMG, 2), (T2V, 3), (IMG, 4)):
+        s.enqueue(job(jtype, ts))
+
+    s._take(now=100, device="a")                 # a разогрелась на t2v
+    s._take(now=100, device="b")                 # b взяла картинку
+
+    assert s._take(now=100, device="a")["type"] == T2V
+    assert s._take(now=100, device="b")["type"] == IMG
+
+
+def test_user_rotation_is_shared_by_all_cards():
+    """Круг по людям общий: вторая карта не даёт первому человеку вторую долю."""
+    s = make_scheduler(devices=("a", "b"), max_user_batch=1)
+    s.enqueue(job(IMG, 1, user=1))
+    s.enqueue(job(IMG, 2, user=1))
+    s.enqueue(job(IMG, 3, user=2))
+
+    assert s._take(now=100, device="a")["user"] == 1
+    assert s._take(now=100, device="b")["user"] == 2
+
+
+def test_video_cap_sends_the_second_card_to_cheap_work():
+    """Потолок общий на пул: он про оперативку, а не про число карт."""
+    s = make_scheduler(devices=("a", "b"), max_concurrent_video=1)
+    for jtype, ts in ((T2V, 1), (T2V, 2), (IMG, 3)):
+        s.enqueue(job(jtype, ts))
+
+    assert s._take(now=100, device="a")["type"] == T2V
+    assert s._take(now=100, device="b")["type"] == IMG   # видео ей брать нельзя
+
+
+def test_video_cap_can_leave_a_card_idle():
+    """Ждут одни видео при выбранном потолке — карта не получает ничего."""
+    s = make_scheduler(devices=("a", "b"), max_concurrent_video=1)
+    s.enqueue(job(T2V, 1))
+    s.enqueue(job(T2V, 2))
+
+    assert s._take(now=100, device="a")["id"] == "t2v-1"
+    assert s._take(now=100, device="b") is None
+
+
+def test_finish_releases_the_video_cap():
+    """Досчитали — место под видео освободилось, соседняя карта его получает."""
+    s = make_scheduler(devices=("a", "b"), max_concurrent_video=1)
+    first, second = job(T2V, 1), job(T2V, 2)
+    s.enqueue(first)
+    s.enqueue(second)
+
+    taken = s._take(now=100, device="a")
+    assert s._take(now=100, device="b") is None
+
+    s.finish(taken)
+    assert s._take(now=100, device="b")["id"] == "t2v-2"
+
+
+def test_no_cap_by_default():
+    """Без потолка обе карты берут видео — однокарточное поведение не меняется."""
+    s = make_scheduler(devices=("a", "b"))
+    s.enqueue(job(T2V, 1))
+    s.enqueue(job(T2V, 2))
+
+    assert s._take(now=100, device="a") is not None
+    assert s._take(now=100, device="b") is not None
+
+
+def test_service_order_covers_the_whole_queue_on_a_pool():
+    """Прогон порядка на пуле разбирает очередь целиком, а не до первой карты."""
+    s = make_scheduler(devices=("a", "b"))
+    for ts in (1, 2, 3, 4):
+        s.enqueue(job(IMG, ts))
+
+    order = s.service_order(now=100)
+    assert [j["id"] for j in order] == ["img-1", "img-2", "img-3", "img-4"]
+
+
+def test_snapshot_reports_every_card():
+    """В снимке видно состояние каждой карты и занятость потолка."""
+    s = make_scheduler(devices=("a", "b"), max_concurrent_video=1)
+    s.enqueue(job(T2V, 1))
+    s._take(now=100, device="a")
+
+    snap = s.snapshot(now=100)
+    assert set(snap["devices"]) == {"a", "b"}
+    assert snap["devices"]["a"]["resident_vtype"] == T2V
+    assert snap["devices"]["a"]["running"] == "t2v-1"
+    assert snap["devices"]["b"]["resident_vtype"] is None
+    assert snap["video_running"] == 1
+    assert snap["max_concurrent_video"] == 1

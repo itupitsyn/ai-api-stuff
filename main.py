@@ -503,16 +503,79 @@ QUEUE_FULL_DETAIL = f"уже {MAX_USER_INFLIGHT} задач в работе, д�
 # держит» (замер: 1217 МБ).
 FREE_VRAM_TARGET_MB = 20000
 
+# Карты пула и адреса их ComfyUI — по одному экземпляру на карту, парами по
+# порядку. GPU_DEVICES="0,1" + COMFYUI_URLS="http://comfyui-0:8188,http://comfyui-1:8188".
+# Один COMFYUI_URL и одна карта — прежняя однокарточная конфигурация.
+GPU_DEVICES = [int(d) for d in
+               os.getenv("GPU_DEVICES", "0").replace(" ", "").split(",") if d]
+COMFYUI_URLS = [u for u in
+                os.getenv("COMFYUI_URLS", os.getenv("COMFYUI_URL", "")).split(",") if u]
+
+# Сколько оперативной памяти просит одно видео. ComfyUI держит staging-буферы
+# под H3 в page-locked памяти: замер на боксе — ram_avail падал с 61 до 21 ГБ.
+# Делить их между экземплярами нельзя, поэтому два видео разом требуют вдвое.
+VIDEO_RAM_BUDGET_GB = 40
+
+
+def _max_concurrent_video(devices):
+    """Сколько видео тянет оперативка. Ограничение общее на пул.
+
+    Упирается не в карты, а в RAM: на 78 ГБ помещается одно видео, на 256 —
+    четыре. Считаем здесь, а не в планировщике: тот намеренно ничего не знает
+    ни про /proc, ни про железо. ``MAX_CONCURRENT_VIDEO`` в окружении
+    перекрывает расчёт, "0" снимает потолок совсем.
+    """
+    override = os.getenv("MAX_CONCURRENT_VIDEO")
+    if override is not None:
+        return int(override) or None
+
+    total_gb = 0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal"):
+                    total_gb = int(line.split()[1]) / 1024 / 1024
+                    break
+    except OSError:      # не Linux — на потолок не претендуем
+        return None
+
+    fits = int(total_gb // VIDEO_RAM_BUDGET_GB)
+    return max(1, min(fits, len(devices)))
+
+
 scheduler = Scheduler(
     VIDEO_TYPES,
+    devices=tuple(GPU_DEVICES),
     max_video_batch=MAX_VIDEO_BATCH,
     max_wait_secs=MAX_WAIT_SECS,
     max_videos_before_cheap=MAX_VIDEOS_BEFORE_CHEAP,
     max_user_batch=MAX_USER_BATCH,
     max_user_inflight=MAX_USER_INFLIGHT,
+    max_concurrent_video=_max_concurrent_video(GPU_DEVICES),
 )
 
-comfy = ComfyClient()   # HTTP-клиент ComfyUI (соединение только при первом запросе)
+
+class Card:
+    """Одна карта пула: закреплённый за ней GPU-процесс и свой ComfyUI.
+
+    Соседние карты про неё ничего не знают: у каждой свой diffusers-процесс
+    (привязан через CUDA_VISIBLE_DEVICES) и свой экземпляр ComfyUI, поэтому
+    ни ``free()``, ни ``recycle()`` соседа не задевают.
+    """
+
+    def __init__(self, index, comfy_url=None):
+        self.index = index
+        self.comfy = ComfyClient(comfy_url)
+        self.gpu = None          # GpuRunner поднимается в lifespan
+        self.thread = None
+
+    def __repr__(self):
+        return f"<Card {self.index} comfy={self.comfy.base}>"
+
+
+cards = [Card(index, COMFYUI_URLS[i] if i < len(COMFYUI_URLS) else None)
+         for i, index in enumerate(GPU_DEVICES)]
+
 _comfy_templates = {}
 
 
@@ -522,7 +585,7 @@ def _comfy_template(name):
     return _comfy_templates[name]
 
 
-def _run_video_comfy(ptype, data):
+def _run_video_comfy(card, ptype, data):
     """Гонит видео через ComfyUI: подставляет параметры в воркфлоу → run → mp4 bytes."""
     kind = "t2v" if ptype == ProcessType.T2V else "i2v"
     # t2v приходит объектом Item, i2v — dict (там ещё байты картинки из формы)
@@ -532,13 +595,13 @@ def _run_video_comfy(ptype, data):
     image_name = None
     if kind == "i2v":  # стартовую картинку подогнать под холст и загрузить в ComfyUI
         image = prepare_image(model, data["image"], get("width"), get("height"))
-        image_name = comfy.upload_image(image)
+        image_name = card.comfy.upload_image(image)
 
     wf = build_video_workflow(
         model, kind, _comfy_template(template_name(model, kind)),
         prompt=get("prompt"), image_name=image_name,
         width=get("width"), height=get("height"), fps=get("fps"))
-    return comfy.run(wf)
+    return card.comfy.run(wf)
 
 
 def _mem_snapshot():
@@ -556,29 +619,36 @@ def _mem_snapshot():
     return out
 
 
-def _log_resources(tag):
+def _log_resources(card, tag):
     """Сколько было свободно на входе в задачу.
 
     Без этого медленный прогон неотличим от быстрого задним числом: тайминги
-    показывают, ЧТО тормозило, а этот снимок — почему.
+    показывают, ЧТО тормозило, а этот снимок — почему. VRAM спрашиваем у своего
+    ComfyUI: у каждой карты она своя, общая цифра тут ничего не значила бы.
     """
-    vram = comfy.vram_free_mb()
+    vram = card.comfy.vram_free_mb()
     m = _mem_snapshot()
     swap_used = (m.get("SwapTotal", 0) - m.get("SwapFree", 0)) or 0
-    print(f"[res] {tag} | vram_free {vram if vram is not None else '?'} MB"
+    print(f"[res] gpu{card.index} {tag} | vram_free {vram if vram is not None else '?'} MB"
           f" | ram_avail {m.get('MemAvailable', '?')} MB"
           f" | cached {m.get('Cached', '?')} MB"
           f" | swap_used {swap_used} MB", flush=True)
 
 
-def worker(results, lock, gpu):
-    print("Worker started", flush=True)
+def worker(results, lock, card):
+    """Поток обслуживания одной карты. Потоков столько же, сколько карт.
+
+    Состояние ниже — про эту карту и только про неё: у соседней свои тёплая
+    модель и свой бэкенд, и планировщик учитывает это отдельно.
+    """
+    gpu = card.gpu
+    print(f"Worker started on gpu{card.index}", flush=True)
 
     loaded = None    # ProcessType в diffusers-процессе (для recycle при смене модели)
     backend = None   # "comfy" | "diffusers" — кто последним держал VRAM
 
     while True:
-        job = scheduler.next_job()
+        job = scheduler.next_job(card.index)
         if job is None:  # остановка
             break
 
@@ -612,7 +682,7 @@ def worker(results, lock, gpu):
         # боксе: ComfyUI держал 18.8 ГБ, свободно оставалось 3 МБ).
         t_sw = time.time()
         if job_backend == "diffusers" and backend != "diffusers":
-            comfy.free(wait_vram_mb=FREE_VRAM_TARGET_MB)
+            card.comfy.free(wait_vram_mb=FREE_VRAM_TARGET_MB)
         elif backend == "diffusers" and job_backend == "comfy":
             gpu.recycle()
             loaded = None
@@ -627,17 +697,18 @@ def worker(results, lock, gpu):
         waited = t_job - job.get("ts", t_job)
         print(f"[worker] start {type.value} {id} | waited {waited:.1f}s"
               f" | backend {job_backend} | switch {switch:.1f}s", flush=True)
-        _log_resources(f"before {type.value}")
+        _log_resources(card, f"before {type.value}")
         try:
             with lock:
                 results[id] = {"status": Status.IN_PROGRESS}
-                current.update({"id": id, "type": type, "backend": job_backend,
-                                "user": job.get("user"), "started": time.time()})
+                current[card.index] = {
+                    "id": id, "type": type, "backend": job_backend,
+                    "user": job.get("user"), "started": time.time()}
 
             # --- видео через ComfyUI (host-сторона, без diffusers-процесса) ---
             if job_backend == "comfy":
                 try:
-                    res = _run_video_comfy(type, data)
+                    res = _run_video_comfy(card, type, data)
                     with lock:
                         results[id] = {"status": Status.DONE, "data": base64.b64encode(res)}
                 except Exception as e:
@@ -697,33 +768,35 @@ def worker(results, lock, gpu):
             scheduler.finish(job)
             print(f"[worker] done  {type.value} {id} |"
                   f" total {time.time() - t_job:.1f}s", flush=True)
-            _log_resources(f"after  {type.value}")
+            _log_resources(card, f"after  {type.value}")
 
 
 load_dotenv()
 results = {}
 lock = threading.Lock()
-# Последняя взятая воркером задача — для /api/queue. Специально НЕ чистим по
-# завершении: признак «ещё выполняется» — статус IN_PROGRESS в results, который
-# воркер и так проставляет. Иначе пришлось бы оборачивать всё тело цикла в
-# try/finally ради одного поля.
+# Последняя взятая задача КАЖДОЙ карты — для /api/queue: карта -> задача.
+# Специально НЕ чистим по завершении: признак «ещё выполняется» — статус
+# IN_PROGRESS в results, который воркер и так проставляет. Иначе пришлось бы
+# оборачивать всё тело цикла в try/finally ради одного поля.
 current = {}
-gpu = None
-worker_thread = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global gpu, worker_thread
-    gpu = GpuRunner(gpu_worker)
-    worker_thread = threading.Thread(target=worker, args=(results, lock, gpu),
-                                     daemon=True)
-    worker_thread.start()
+    print(f"Карты: {cards} | потолок одновременных видео: "
+          f"{scheduler.max_concurrent_video}", flush=True)
+
+    for card in cards:
+        card.gpu = GpuRunner(gpu_worker, device=card.index)
+        card.thread = threading.Thread(target=worker, args=(results, lock, card),
+                                       daemon=True, name=f"worker-gpu{card.index}")
+        card.thread.start()
 
     yield
 
     scheduler.stop()
-    gpu.stop()
+    for card in cards:
+        card.gpu.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -837,11 +910,15 @@ def get_queue():
     snap = scheduler.snapshot(now=now)
 
     with lock:
-        run = dict(current) if current else None
-        # current — последняя ВЗЯТАЯ задача; выполняется она, только пока воркер
-        # не сменил её статус на DONE/ERROR (либо пока результат не забрали)
-        if run and results.get(run["id"], {}).get("status") != Status.IN_PROGRESS:
-            run = None
+        # current[card] — последняя ВЗЯТАЯ карты задача; выполняется она, только
+        # пока воркер не сменил её статус на DONE/ERROR (либо пока результат не
+        # забрали)
+        running = {}
+        for card in cards:
+            run = current.get(card.index)
+            if run and results.get(run["id"], {}).get("status") == Status.IN_PROGRESS:
+                running[card.index] = run
+
         awaiting_pickup = sum(1 for r in results.values()
                               if r["status"] in (Status.DONE, Status.ERROR))
 
@@ -849,15 +926,32 @@ def get_queue():
     for j in snap["pending"]:
         by_type[j["type"].value] = by_type.get(j["type"].value, 0) + 1
 
-    resident = snap["resident_vtype"]
+    def _card_state(card):
+        run = running.get(card.index)
+        dev = snap["devices"].get(card.index, {})
+        resident = dev.get("resident_vtype")
+
+        return {
+            "comfy": card.comfy.base,
+            "alive": card.thread is not None and card.thread.is_alive(),
+            "resident_vtype": resident.value if resident else None,
+            "subtype_streak": dev.get("subtype_streak"),
+            "video_streak": dev.get("video_streak"),
+            "running": {
+                "id": run["id"],
+                "type": run["type"].value,
+                "backend": run["backend"],      # comfy | diffusers
+                "user": run.get("user"),
+                "elapsed": round(now - run["started"], 1),
+            } if run else None,
+        }
+
     return {
-        "running": {
-            "id": run["id"],
-            "type": run["type"].value,
-            "backend": run["backend"],          # comfy | diffusers
-            "user": run.get("user"),
-            "elapsed": round(now - run["started"], 1),
-        } if run else None,
+        # Что считает каждая карта. Ключ — её номер в GPU_DEVICES.
+        "devices": {card.index: _card_state(card) for card in cards},
+        # Первая занятая карта — чтобы старые читатели снимка не сломались.
+        "running": next((_card_state(c)["running"] for c in cards
+                         if running.get(c.index)), None),
         # В порядке ОБСЛУЖИВАНИЯ, а не постановки: очередь не FIFO — порядок
         # задают круг по людям и батчинг. Бот по этому списку считает «ты N-й»,
         # так что хронология тут была бы враньём.
@@ -872,9 +966,8 @@ def get_queue():
             "awaiting_pickup": awaiting_pickup,  # готовые, за которыми не пришли
         },
         "scheduler": {
-            "resident_vtype": resident.value if resident else None,
-            "subtype_streak": snap["subtype_streak"],
-            "video_streak": snap["video_streak"],
+            "video_running": snap["video_running"],
+            "max_concurrent_video": snap["max_concurrent_video"],
             "next_id": snap["next_id"],
             "current_user": snap["current_user"],
             "user_streak": snap["user_streak"],
@@ -883,10 +976,13 @@ def get_queue():
                        "max_wait_secs": MAX_WAIT_SECS,
                        "max_videos_before_cheap": MAX_VIDEOS_BEFORE_CHEAP,
                        "max_user_batch": MAX_USER_BATCH,
-                       "max_user_inflight": MAX_USER_INFLIGHT},
+                       "max_user_inflight": MAX_USER_INFLIGHT,
+                       "max_concurrent_video": scheduler.max_concurrent_video},
         },
-        # False при живой очереди = воркер умер, задачи не разгребаются
-        "worker_alive": worker_thread is not None and worker_thread.is_alive(),
+        # False при живой очереди = все воркеры умерли, задачи не разгребаются.
+        # По картам живость видна в devices[N].alive.
+        "worker_alive": any(c.thread is not None and c.thread.is_alive()
+                            for c in cards),
     }
 
 

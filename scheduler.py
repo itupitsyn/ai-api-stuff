@@ -21,6 +21,26 @@
 вырождается в FIFO, отменяя справедливость. Между людьми от голодания защищает
 сам круг: каждый получает свой квант за один оборот.
 
+Карт может быть несколько. Устройства — однородный пул: роли за ними не
+закреплены, а «на этой карте видео-модель уже тёплая» — не правило, а повод
+предпочесть задачу без смены модели. Специализация из-за этого возникает сама,
+когда выгодна, и растворяется, когда нет: на двух картах видео липнет к
+прогретой, а картинки уходят на соседнюю; на четырёх при видео-нагрузке все
+четыре поднимут видео-модель. Поведение вытекает из чисел, а не из захардкоженных
+ролей, поэтому переезд на другое железо кода не требует.
+
+Что глобально, а что на карту:
+
+  * круг по людям — **глобальный**: человеку важно, сколько он получил всего, а
+    не на какой карте;
+  * тёплая модель и счётчики батчинга — **свои у каждой карты** (:class:`Device`).
+
+``max_concurrent_video`` ограничивает, сколько видео считается одновременно на
+всём пуле. Это про оперативную память, а не про карты: каждый ComfyUI держит
+свои staging-буферы (замер на боксе — около 40 ГБ), и два видео разом в 78 ГБ
+не помещаются, сколько бы ни было GPU. Число приходит снаружи: планировщик
+намеренно ничего не знает ни про /proc, ни про железо. ``None`` — без потолка.
+
 Задача — это dict как минимум с "type", "ts" (unix-время постановки) и "user"
 (id владельца; None — общий анонимный пользователь, который в круге и под
 потолком участвует наравне с остальными).
@@ -38,34 +58,66 @@ def user_of(job):
     return job.get("user")
 
 
-class Policy:
-    """Состояние политики: что тёплое на карте и чей сейчас черёд.
+class Device:
+    """Состояние одной карты: что на ней тёплое и сколько подряд обслужено.
 
-    Отдельным объектом, потому что нужно дважды: планировщику — для настоящего
-    выбора, снимку — для прогона будущего порядка на копии.
+    Живёт на устройство, а не на планировщик: у каждой карты своя резидентная
+    модель, и батчинг одной не должен влиять на выбор другой.
     """
 
-    __slots__ = ("resident_vtype", "subtype_streak", "video_streak",
-                 "user_order", "current_user", "user_streak")
+    __slots__ = ("resident_vtype", "subtype_streak", "video_streak")
 
     def __init__(self):
         self.resident_vtype = None   # видео-подтип, сейчас загруженный в слот
         self.subtype_streak = 0      # видео этого подтипа обслужено подряд
         self.video_streak = 0        # видео любого типа обслужено подряд
-        self.user_order = []         # круг: порядок, в котором доходит очередь
-        self.current_user = None     # кого обслуживаем прямо сейчас
-        self.user_streak = 0         # сколько его задач обслужено подряд
 
     def copy(self):
-        other = Policy()
+        other = Device()
         for name in self.__slots__:
             setattr(other, name, getattr(self, name))
-        other.user_order = list(self.user_order)
 
         return other
 
-    def record(self, job, video_types):
-        """Учитывает обслуженную задачу."""
+
+class Policy:
+    """Состояние политики: круг по людям (общий) и карты (каждая со своим).
+
+    Отдельным объектом, потому что нужно дважды: планировщику — для настоящего
+    выбора, снимку — для прогона будущего порядка на копии.
+    """
+
+    __slots__ = ("user_order", "current_user", "user_streak", "devices")
+
+    def __init__(self):
+        self.user_order = []         # круг: порядок, в котором доходит очередь
+        self.current_user = None     # кого обслуживаем прямо сейчас
+        self.user_streak = 0         # сколько его задач обслужено подряд
+        self.devices = {}            # ключ устройства -> Device
+
+    def device(self, device=None):
+        """Состояние карты; заводится при первом обращении.
+
+        Ключ ``None`` — единственная карта. Так однокарточная конфигурация
+        остаётся частным случаем пула, а не отдельной веткой кода.
+        """
+        state = self.devices.get(device)
+        if state is None:
+            state = self.devices[device] = Device()
+
+        return state
+
+    def copy(self):
+        other = Policy()
+        other.current_user = self.current_user
+        other.user_streak = self.user_streak
+        other.user_order = list(self.user_order)
+        other.devices = {k: v.copy() for k, v in self.devices.items()}
+
+        return other
+
+    def record(self, job, video_types, device=None):
+        """Учитывает обслуженную задачу на карте ``device``."""
         user = user_of(job)
         if user == self.current_user:
             self.user_streak += 1
@@ -78,18 +130,19 @@ class Policy:
             self.current_user = user
             self.user_streak = 1
 
+        dev = self.device(device)
         jtype = job["type"]
         if jtype in video_types:
-            self.video_streak += 1
-            if jtype == self.resident_vtype:
-                self.subtype_streak += 1
+            dev.video_streak += 1
+            if jtype == dev.resident_vtype:
+                dev.subtype_streak += 1
             else:
-                self.resident_vtype = jtype
-                self.subtype_streak = 1
+                dev.resident_vtype = jtype
+                dev.subtype_streak = 1
         else:
             # лёгкая задача сбрасывает счётчик видео подряд; видео-слот не
             # трогаем, поэтому resident_vtype/subtype_streak сохраняются
-            self.video_streak = 0
+            dev.video_streak = 0
 
 
 def pick_user(pending, policy, *, max_user_batch):
@@ -113,17 +166,41 @@ def pick_user(pending, policy, *, max_user_batch):
     return user_of(min(pending, key=lambda j: j["ts"]))
 
 
-def pick_job(pending, video_types, policy, *, max_video_batch, max_wait_secs,
-             max_videos_before_cheap, max_user_batch, now=None):
-    """Чистая функция выбора следующей задачи из непустого ``pending``.
+def startable(pending, video_types, *, video_running=0,
+              max_concurrent_video=None):
+    """Задачи, которые можно начать прямо сейчас.
 
-    Возвращает выбранный элемент ``pending`` (не удаляя его).
+    Отсекает видео, когда на пуле их уже считается ``max_concurrent_video``.
+    Ограничение общее на все карты, потому что упирается оно в оперативную
+    память, а не в GPU — подробности в доке модуля.
+    """
+    if max_concurrent_video is None or video_running < max_concurrent_video:
+        return pending
+
+    return [j for j in pending if j["type"] not in video_types]
+
+
+def pick_job(pending, video_types, policy, *, max_video_batch, max_wait_secs,
+             max_videos_before_cheap, max_user_batch, device=None,
+             video_running=0, max_concurrent_video=None, now=None):
+    """Чистая функция выбора следующей задачи для карты ``device``.
+
+    Возвращает выбранный элемент ``pending`` (не удаляя его) либо ``None``,
+    если начать сейчас нечего: ждут одни видео, а потолок одновременных видео
+    уже выбран. Карте в этом случае остаётся ждать освобождения места, а не
+    хвататься за задачу, которую всё равно не потянуть.
     """
     if now is None:
         now = time.time()
 
-    user = pick_user(pending, policy, max_user_batch=max_user_batch)
-    mine = [j for j in pending if user_of(j) == user]
+    ready = startable(pending, video_types, video_running=video_running,
+                      max_concurrent_video=max_concurrent_video)
+    if not ready:
+        return None
+
+    dev = policy.device(device)
+    user = pick_user(ready, policy, max_user_batch=max_user_batch)
+    mine = [j for j in ready if user_of(j) == user]
 
     # Анти-старвейшн — ВНУТРИ выбранного человека, а не поверх круга.
     #
@@ -141,12 +218,14 @@ def pick_job(pending, video_types, policy, *, max_video_batch, max_wait_secs,
     # не мариновать лёгкие задачи: после N видео подряд пропускаем вперёд
     # ожидающую картинку/транскрипцию (видео-слот при этом остаётся тёплым)
     cheap = [j for j in mine if j["type"] not in video_types]
-    if cheap and policy.video_streak >= max_videos_before_cheap:
+    if cheap and dev.video_streak >= max_videos_before_cheap:
         return min(cheap, key=lambda j: j["ts"])
 
-    # держим видео-модель тёплой: добиваем задачи резидентного видео-подтипа
-    if policy.resident_vtype in video_types and policy.subtype_streak < max_video_batch:
-        same = [j for j in mine if j["type"] == policy.resident_vtype]
+    # Держим видео-модель тёплой: добиваем задачи резидентного видео-подтипа
+    # ЭТОЙ карты. Соседняя со своей моделью на выбор не влияет — она разберёт
+    # то, что тёплое у неё, и специализация складывается сама собой.
+    if dev.resident_vtype in video_types and dev.subtype_streak < max_video_batch:
+        same = [j for j in mine if j["type"] == dev.resident_vtype]
         if same:
             return min(same, key=lambda j: j["ts"])
 
@@ -162,9 +241,12 @@ class Scheduler:
     навсегда.
     """
 
-    def __init__(self, video_types, *, max_video_batch=10, max_wait_secs=900,
-                 max_videos_before_cheap=3, max_user_batch=2, max_user_inflight=5):
+    def __init__(self, video_types, *, devices=(None,), max_video_batch=10,
+                 max_wait_secs=900, max_videos_before_cheap=3, max_user_batch=2,
+                 max_user_inflight=5, max_concurrent_video=None):
         self.video_types = tuple(video_types)
+        self.devices = tuple(devices)
+        self.max_concurrent_video = max_concurrent_video
         self.max_video_batch = max_video_batch
         self.max_wait_secs = max_wait_secs
         self.max_videos_before_cheap = max_videos_before_cheap
@@ -173,6 +255,7 @@ class Scheduler:
 
         self._pending = []
         self._inflight = {}   # пользователь -> задач в работе (в очереди + на счёте)
+        self._running = {}    # карта -> задача, которую она считает прямо сейчас
         self._cv = threading.Condition()
         self._stopping = False
 
@@ -180,19 +263,21 @@ class Scheduler:
         self.policy = Policy()
 
     # ------------------------------------------------------------------
-    #  Снаружи и в тестах эти три читаются как поля планировщика.
+    #  Снаружи и в тестах эти три читаются как поля планировщика. При
+    #  нескольких картах они относятся к первой из ``devices`` — для пула
+    #  смотри ``snapshot()["devices"]``.
     # ------------------------------------------------------------------
     @property
     def resident_vtype(self):
-        return self.policy.resident_vtype
+        return self.policy.device(self.devices[0]).resident_vtype
 
     @property
     def subtype_streak(self):
-        return self.policy.subtype_streak
+        return self.policy.device(self.devices[0]).subtype_streak
 
     @property
     def video_streak(self):
-        return self.policy.video_streak
+        return self.policy.device(self.devices[0]).video_streak
 
     def enqueue(self, job):
         """Ставит задачу в очередь.
@@ -219,16 +304,37 @@ class Scheduler:
         return True
 
     def finish(self, job):
-        """Задача досчитана: освобождает место в допуске под следующую."""
+        """Задача досчитана: освобождает место в допуске и карту под следующую.
+
+        Будим всех: место могло освободиться не только под ту карту, что
+        закончила, — если упирались в потолок одновременных видео, ждать могли
+        и остальные.
+        """
         user = user_of(job)
 
         with self._cv:
+            for device, running in list(self._running.items()):
+                if running is job:
+                    del self._running[device]
+                    break
+
             left = self._inflight.get(user, 0) - 1
             if left > 0:
                 self._inflight[user] = left
             else:
                 self._inflight.pop(user, None)
                 self._prune_order()
+
+            self._cv.notify_all()
+
+    def _video_running(self, exclude=None):
+        """Сколько видео считается прямо сейчас (вызывать под ``self._cv``).
+
+        Карту, которая как раз спрашивает себе работу, из счёта исключаем: она
+        свободна, что бы там ни осталось в ``_running`` от прошлой задачи.
+        """
+        return sum(1 for device, job in self._running.items()
+                   if device != exclude and job["type"] in self.video_types)
 
     def inflight_count(self, user):
         """Сколько задач этого пользователя сейчас в работе."""
@@ -254,7 +360,7 @@ class Scheduler:
         alive = {user_of(j) for j in self._pending} | set(self._inflight)
         self.policy.user_order = [u for u in self.policy.user_order if u in alive]
 
-    def _pick(self, now=None):
+    def _pick(self, now=None, device=None):
         """Выбор без удаления и без учёта (вызывать под ``self._cv``)."""
         return pick_job(
             self._pending, self.video_types, self.policy,
@@ -262,6 +368,9 @@ class Scheduler:
             max_wait_secs=self.max_wait_secs,
             max_videos_before_cheap=self.max_videos_before_cheap,
             max_user_batch=self.max_user_batch,
+            device=device,
+            video_running=self._video_running(exclude=device),
+            max_concurrent_video=self.max_concurrent_video,
             now=now,
         )
 
@@ -278,18 +387,28 @@ class Scheduler:
             policy = self.policy.copy()
 
         order = []
+        step = 0
         while pending:
+            # карты разбирают очередь по кругу; потолок видео в прогоне не
+            # учитываем — он сдвигает СТАРТ во времени, а не место в очереди,
+            # а снаружи спрашивают именно «какой я по счёту»
+            device = self.devices[step % len(self.devices)]
             job = pick_job(
                 pending, self.video_types, policy,
                 max_video_batch=self.max_video_batch,
                 max_wait_secs=self.max_wait_secs,
                 max_videos_before_cheap=self.max_videos_before_cheap,
                 max_user_batch=self.max_user_batch,
+                device=device,
                 now=now,
             )
+            if job is None:
+                break
+
             pending.remove(job)
-            policy.record(job, self.video_types)
+            policy.record(job, self.video_types, device)
             order.append(job)
+            step += 1
 
         return order
 
@@ -305,37 +424,62 @@ class Scheduler:
             return {
                 "pending": [{"id": j.get("id"), "type": j["type"], "ts": j["ts"],
                              "user": user_of(j)} for j in order],
-                "resident_vtype": self.policy.resident_vtype,
-                "subtype_streak": self.policy.subtype_streak,
-                "video_streak": self.policy.video_streak,
+                "devices": {
+                    device: {
+                        "resident_vtype": self.policy.device(device).resident_vtype,
+                        "subtype_streak": self.policy.device(device).subtype_streak,
+                        "video_streak": self.policy.device(device).video_streak,
+                        "running": (self._running.get(device) or {}).get("id"),
+                    }
+                    for device in self.devices
+                },
+                "video_running": self._video_running(),
+                "max_concurrent_video": self.max_concurrent_video,
+                # три поля ниже — про первую карту; оставлены, чтобы не ломать
+                # тех, кто читал снимок до появления пула
+                "resident_vtype": self.resident_vtype,
+                "subtype_streak": self.subtype_streak,
+                "video_streak": self.video_streak,
                 "current_user": self.policy.current_user,
                 "user_streak": self.policy.user_streak,
                 "inflight": dict(self._inflight),
                 "next_id": order[0].get("id") if order else None,
             }
 
-    def _take(self, now=None):
-        """Небл. ядро: выбирает, удаляет и учитывает задачу. None, если пусто.
+    def _take(self, now=None, device=None):
+        """Небл. ядро: выбирает, удаляет и учитывает задачу для карты.
 
-        Общая основа для :meth:`next_job` и для тестов (там передают ``now``).
-        Вызывающий обеспечивает отсутствие гонок (держит ``self._cv`` либо
-        работает однопоточно).
+        ``None`` — брать нечего: либо очередь пуста, либо ждут одни видео при
+        выбранном потолке. Общая основа для :meth:`next_job` и для тестов (там
+        передают ``now``). Вызывающий обеспечивает отсутствие гонок (держит
+        ``self._cv`` либо работает однопоточно).
         """
         if not self._pending:
             return None
 
-        job = self._pick(now=now)
+        job = self._pick(now=now, device=device)
+        if job is None:
+            return None
+
         self._pending.remove(job)
-        self.policy.record(job, self.video_types)
+        self.policy.record(job, self.video_types, device)
+        self._running[device] = job
 
         return job
 
-    def next_job(self):
-        """Блокирующе ждёт и возвращает следующую задачу; None при остановке."""
-        with self._cv:
-            while not self._pending and not self._stopping:
-                self._cv.wait()
-            if self._stopping and not self._pending:
-                return None
+    def next_job(self, device=None):
+        """Блокирующе ждёт задачу для карты ``device``; None при остановке.
 
-            return self._take()
+        Ждём не только пустую очередь, но и занятый потолок видео: задача может
+        лежать в очереди и всё равно быть не начинаемой прямо сейчас. Разбудит
+        :meth:`enqueue` или :meth:`finish`.
+        """
+        with self._cv:
+            while True:
+                job = self._take(device=device)
+                if job is not None:
+                    return job
+                if self._stopping:
+                    return None
+
+                self._cv.wait()
