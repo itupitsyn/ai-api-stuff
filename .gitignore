@@ -9,3 +9,5 @@ comfyui/models
 comfyui/output
 .pytest_cache
 .claude
+docker-compose.override.yml
+comfyui/output-*

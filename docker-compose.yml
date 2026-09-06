@@ -22,22 +22,23 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['0', '1']
+              # count: all, а не список — сервису нужны ВСЕ карты, а какую взять,
+              # каждый дочерний процесс решает сам через CUDA_VISIBLE_DEVICES.
+              # Список пришлось бы править под каждое железо; узлы /dev/nvidiaN
+              # прокидывает сам nvidia-runtime, перечислять их не нужно.
+              count: all
               capabilities: [gpu, utility, compute]
-    devices:
-      - /dev/nvidia0:/dev/nvidia0       # обе карты: дочерние процессы сами
-      - /dev/nvidia1:/dev/nvidia1       # закрепляются за своей через CUDA_VISIBLE_DEVICES
-      - /dev/nvidiactl:/dev/nvidiactl   # Общий контроллер (нужен всегда)
-      - /dev/nvidia-uvm:/dev/nvidia-uvm # Для работы с памятью (нужен всегда)
-      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools # Добавь этот узел для инструментов мониторинга
   
     environment:
-      - NVIDIA_VISIBLE_DEVICES=0,1 # обе карты видны контейнеру
+      - NVIDIA_VISIBLE_DEVICES=all # какие использовать — решает GPU_DEVICES ниже
       - NVIDIA_DRIVER_CAPABILITIES=all
       # Пул карт и адреса их ComfyUI — парами по порядку. Одна карта и один
       # COMFYUI_URL — прежняя однокарточная конфигурация, код её поддерживает.
-      - GPU_DEVICES=0,1
-      - COMFYUI_URLS=http://comfyui-0:8188,http://comfyui-1:8188
+      # Одна карта — конфигурация по умолчанию, файл рабочий как есть.
+      # Больше карт добавляет docker-compose.override.yml: сгенерируй его
+      # скриптом gen-gpu-override.sh, он же перепишет эти две переменные.
+      - GPU_DEVICES=0
+      - COMFYUI_URLS=http://comfyui-0:8188
       # Потолок одновременных видео. Пусто — считается от MemTotal: одно видео
       # просит около 40 ГБ staging-буферов, делить их между экземплярами нельзя.
       # Поставь число, чтобы перекрыть расчёт; 0 — снять потолок совсем.
@@ -58,7 +59,6 @@ services:
 
     depends_on:
       - comfyui-0
-      - comfyui-1
 
     command: ["fastapi", "run", "main.py", "--port", "8000", "--no-reload"]
 
@@ -66,136 +66,14 @@ services:
 
     # <<: *default-logging
 
-  # ------------------------------------------------------------------------
-  # ComfyUI — мотор видео-генерации (fp8_scaled). Делит GPU 0 с ai-api-stuff;
-  # наш воркер шлёт сюда воркфлоу и дёргает /free на границах, чтобы отдавать
-  # VRAM под картинки/аудио. Порт наружу не обязателен (общаемся по сети compose).
-  # ------------------------------------------------------------------------
-  comfyui-0:
-    build:
-      context: ./comfyui
-      dockerfile: Dockerfile
-    container_name: comfyui-0
-
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ['0']
-              capabilities: [gpu, utility, compute]
-    devices:
-      - /dev/nvidia0:/dev/nvidia0
-      - /dev/nvidiactl:/dev/nvidiactl
-      - /dev/nvidia-uvm:/dev/nvidia-uvm
-      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
-
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=0
-      - NVIDIA_DRIVER_CAPABILITIES=all
-
-    volumes:
-      # модели качаются скриптом comfyui/download_models.sh в ./comfyui/models/
-      - ./comfyui/models:/opt/ComfyUI/models
-      - ./comfyui/output-0:/opt/ComfyUI/output
-
-    # Переопределяем CMD образа, чтобы менять флаги без пересборки: Dockerfile
-    # клонирует ComfyUI по --depth 1 с HEAD, и пересборка притащила бы другую
-    # версию вместо работающей 0.31.0.
-    #
-    # --disable-pinned-memory УБРАН. Он ставился против OOM-killer'а на длинных
-    # клипах H3, но наша нагрузка — 124 кадра (5 с), там до потолка RAM далеко.
-    # Ценой была скорость: без page-locked памяти "async weight offloading"
-    # не может делать асинхронный DMA, копии CPU<->GPU идут через промежуточный
-    # буфер драйвера и не перекрываются со счётом. Замер на медленной фазе:
-    # GPU 0%, шина ~0, одно ядро на 75-100%. Если OOM всё же вернётся —
-    # не возвращай флаг, а ограничь потолок пиннинга: --cache-ram 6 32
-    # (по умолчанию порог inactive/pin = 100% системной RAM).
-    # --reserve-vram НЕ ставить. Проверено 2026-08-22: с "--reserve-vram 14"
-    # (столько нужно картиночной модели с enable_model_cpu_offload, пик 12.9 ГБ)
-    # у ComfyUI остаётся ~10 ГБ на 20-гигабайтную H3, и фаза диффузии
-    # растягивается со 175 с до 450+ с при GPU в нуле и 127 Вт — модель
-    # стримится через шину непрерывно. Размен невыгоден: чинит редкий случай
-    # (картинка между видео) ценой частого (серия видео за 160 с).
-    # --disable-mmap НЕ ставить, хотя соблазн есть. Проверено 2026-08-22:
-    # тёплое видео ускоряется вдвое (159.7 -> 88.0 с), потому что без mmap ядро
-    # не вытесняет страницы весов прямо во время генерации. НО веса становятся
-    # анонимной памятью: ComfyUI держит ~45 ГБ, page cache вытесняется, и
-    # следующая КАРТИНКА грузится с диска — 338+ с вместо 14. То есть флаг
-    # возвращает исходную жалобу «картинка висит минутами». Плюс анонимную
-    # память ядро не может отдать под давлением — только в своп.
-    command: ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188",
-              "--fp16-intermediates"]
-
-    # порт наружу не обязателен (общаемся по сети compose); раскомментируй для веб-UI:
-    ports:
-      - 8188:8188
-
-    restart: unless-stopped
-
-  # ------------------------------------------------------------------------
-  # ComfyUI — мотор видео-генерации (fp8_scaled). Делит GPU 0 с ai-api-stuff;
-  # наш воркер шлёт сюда воркфлоу и дёргает /free на границах, чтобы отдавать
-  # VRAM под картинки/аудио. Порт наружу не обязателен (общаемся по сети compose).
-  # ------------------------------------------------------------------------
-  comfyui-1:
-    build:
-      context: ./comfyui
-      dockerfile: Dockerfile
-    container_name: comfyui-1
-
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ['1']
-              capabilities: [gpu, utility, compute]
-    devices:
-      - /dev/nvidia1:/dev/nvidia1
-      - /dev/nvidiactl:/dev/nvidiactl
-      - /dev/nvidia-uvm:/dev/nvidia-uvm
-      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
-
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=1
-      - NVIDIA_DRIVER_CAPABILITIES=all
-
-    volumes:
-      # модели качаются скриптом comfyui/download_models.sh в ./comfyui/models/
-      - ./comfyui/models:/opt/ComfyUI/models
-      - ./comfyui/output-1:/opt/ComfyUI/output
-
-    # Переопределяем CMD образа, чтобы менять флаги без пересборки: Dockerfile
-    # клонирует ComfyUI по --depth 1 с HEAD, и пересборка притащила бы другую
-    # версию вместо работающей 0.31.0.
-    #
-    # --disable-pinned-memory УБРАН. Он ставился против OOM-killer'а на длинных
-    # клипах H3, но наша нагрузка — 124 кадра (5 с), там до потолка RAM далеко.
-    # Ценой была скорость: без page-locked памяти "async weight offloading"
-    # не может делать асинхронный DMA, копии CPU<->GPU идут через промежуточный
-    # буфер драйвера и не перекрываются со счётом. Замер на медленной фазе:
-    # GPU 0%, шина ~0, одно ядро на 75-100%. Если OOM всё же вернётся —
-    # не возвращай флаг, а ограничь потолок пиннинга: --cache-ram 6 32
-    # (по умолчанию порог inactive/pin = 100% системной RAM).
-    # --reserve-vram НЕ ставить. Проверено 2026-08-22: с "--reserve-vram 14"
-    # (столько нужно картиночной модели с enable_model_cpu_offload, пик 12.9 ГБ)
-    # у ComfyUI остаётся ~10 ГБ на 20-гигабайтную H3, и фаза диффузии
-    # растягивается со 175 с до 450+ с при GPU в нуле и 127 Вт — модель
-    # стримится через шину непрерывно. Размен невыгоден: чинит редкий случай
-    # (картинка между видео) ценой частого (серия видео за 160 с).
-    # --disable-mmap НЕ ставить, хотя соблазн есть. Проверено 2026-08-22:
-    # тёплое видео ускоряется вдвое (159.7 -> 88.0 с), потому что без mmap ядро
-    # не вытесняет страницы весов прямо во время генерации. НО веса становятся
-    # анонимной памятью: ComfyUI держит ~45 ГБ, page cache вытесняется, и
-    # следующая КАРТИНКА грузится с диска — 338+ с вместо 14. То есть флаг
-    # возвращает исходную жалобу «картинка висит минутами». Плюс анонимную
-    # память ядро не может отдать под давлением — только в своп.
-    command: ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188",
-              "--fp16-intermediates"]
-
-    # порт наружу не обязателен (общаемся по сети compose); раскомментируй для веб-UI:
-    ports:
-      - 8189:8188
-
-    restart: unless-stopped
+  # ComfyUI-сервисы здесь НЕ описаны: их по одному на карту генерирует
+  # gen-gpu-override.sh в docker-compose.override.yml. Держать нулевую карту
+  # тут, а остальные в генераторе, значит дублировать строку запуска — и рано
+  # или поздно карты разъедутся по флагам молча, проявившись как «вторая почему-то
+  # медленнее». Поэтому источник правды один, и он в скрипте.
+  #
+  #     bash gen-gpu-override.sh
+  #     docker compose up -d --remove-orphans
+  #
+  # Без сгенерированного override compose честно откажется стартовать: у API в
+  # depends_on стоит comfyui-0, которого он не найдёт.
