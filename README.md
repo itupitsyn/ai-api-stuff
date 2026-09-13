@@ -13,6 +13,23 @@ sudo apt install nvidia-cuda-toolkit ffmpeg libcudnn8 libcudnn8-dev
 pip install -r requirements.txt
 ```
 
+Устройство сервиса, решения и список проверенного-отвергнутого — в
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
+# Установка
+
+```
+cp .env.example .env        # заполнить HF_API_KEY и CIVIT_AI_API_KEY
+bash comfyui/download_models_h3.sh   # веса видео, ~43 ГБ
+bash fetch-loras.sh                  # LoRA для картинок, ~160 МБ
+bash gen-gpu-override.sh             # сервисы ComfyUI по числу видеокарт
+docker compose up -d --remove-orphans
+```
+
+`fetch-loras.sh` не падает, если файл не скачался: печатает предупреждение и
+завершается успешно. Сервис в этом случае поднимется и будет рисовать базовой
+моделью, сообщив об этом в лог.
+
 # Video models
 
 `/api/t2v` and `/api/i2v` accept a `model` parameter:
