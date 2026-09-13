@@ -10,6 +10,13 @@ pyannote.audio>=4.0
 omegaconf
 fastapi[standard]
 transformers
+# Токенизатор T5 у Chroma лежит как spiece.model — нужен sentencepiece, а
+# protobuf требуется его конвертеру в быстрый токенизатор. tiktoken добавлен
+# потому, что без sentencepiece transformers падает именно с требованием
+# tiktoken (сообщение вводит в заблуждение, но пусть будет оба бэкенда).
+sentencepiece
+protobuf
+tiktoken
 whisperx
 dotenv
 bitsandbytes  # nf4-квантизация Wan для diffusers-отката (USE_COMFYUI=False)

@@ -12,7 +12,9 @@ import time
 import gc
 import traceback
 
-from diffusers import ZImagePipeline, WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline, UniPCMultistepScheduler, WanTransformer3DModel, BitsAndBytesConfig
+from diffusers import (ZImagePipeline, ZImageTransformer2DModel, ChromaPipeline, PipelineQuantizationConfig,
+                       WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline,
+                       UniPCMultistepScheduler, WanTransformer3DModel, BitsAndBytesConfig)
 from diffusers.utils import export_to_video, load_image
 from fastapi import FastAPI, HTTPException, UploadFile, Form
 from fastapi.responses import Response
@@ -74,6 +76,21 @@ class Item(BaseModel):
     # другое значение не ускоряет генерацию, а меняет скорость воспроизведения.
     fps: int | None = None
     model: Literal[tuple(VIDEO_MODELS)] = DEFAULT_MODEL
+    # Переопределения для картинок; не заданы — берётся дефолт модели из
+    # IMAGE_MODELS. Нужны, чтобы подбирать параметры без пересборки образа.
+    steps: int | None = None
+    guidance: float | None = None
+    lora_scale: float | None = None
+    # Оставить включённой только эту LoRA по имени (nipples | mystic | zpenis).
+    lora_only: str | None = None
+    # Негативный промпт. РАБОТАЕТ ТОЛЬКО при guidance > 0: у Z-Image
+    # do_classifier_free_guidance == (guidance > 0), а дефолт для turbo — 0,
+    # и тогда негатив молча игнорируется. Поднятие guidance удваивает счёт
+    # (два прохода на шаг) и для дистиллированной turbo-модели рискованно.
+    negative: str | None = None
+    # Сид: не задан — случайный, но в лог он пишется всегда, поэтому удачную
+    # картинку можно повторить задним числом.
+    seed: int | None = None
 
 
 NEG_PROMPT = (
@@ -101,6 +118,162 @@ USE_COMFYUI = True
 # только вместе с --reserve-vram 14 у ComfyUI и отказом от comfy.free() —
 # и тогда надо проверять, во что это обойдётся серии видео (сейчас 160 с).
 IMAGE_CPU_OFFLOAD = False
+
+# Реестр картиночных моделей: всё, что отличает одну от другой, — здесь, чтобы
+# смена была конфигом, а не правкой кода. Выбор — IMAGE_MODEL в окружении.
+#
+# Z-Image (Tongyi/Alibaba) отказывается рисовать NSFW: safety-тренировка зашита
+# в веса, промптом не обходится. Chroma — 8.9B на базе FLUX.1-schnell,
+# переученная на 5 млн изображений без фильтра ("has not been aligned with a
+# specific safety filter" в карточке), Apache 2.0.
+#
+# Берём вариант Flash: у lodestones это отдельный репозиторий с УЖЕ вмерженными
+# весами в diffusers-формате, поэтому LoRA накатывать не нужно. Он считает за
+# 8 шагов вместо 40 у базовой Chroma — на 3090 это ~13 с, то есть примерно
+# нынешняя скорость Z-Image. Автор требует heun и CFG=1: с дефолтным euler и
+# высоким CFG низкошаговые веса разносит.
+#
+# CFG=1 означает, что classifier-free guidance выключен (diffusers включает его
+# при guidance > 1), поэтому негативный промпт Chroma не увидит — и один проход
+# вместо двух, отсюда и скорость.
+# ``quantize`` — какие компоненты ужать, чтобы модель влезла в VRAM целиком.
+#
+# Chroma в bf16 не помещается: трансформер 16.6 ГБ + T5-XXL 8.9 ГБ + VAE 0.2 =
+# 25.7 ГБ против 23.5 доступных. С cpu_offload она работает, но плохо: модель
+# живёт в RAM, и первый шаг каждой генерации тратит ~15 с на перекачку 16.6 ГБ
+# трансформера по шине (замер 12.09.2026: инференс 37-47 с против 9 у Z-Image).
+# Хуже того, каждый картиночный процесс держит тогда ~21 ГБ RSS, и две карты
+# разом выбирают 60 ГБ машины — earlyoom убивает воркер.
+#
+# Поэтому квантуем ИЗБИРАТЕЛЬНО. T5 отрабатывает ОДИН раз за картинку — его
+# размер важен, скорость нет; int8 ужимает его вдвое, до ~4.5 ГБ. Трансформер
+# крутится 8 раз — его оставляем в bf16, потому что bitsandbytes-int8 в счёте
+# МЕДЛЕННЕЕ bf16 (деквантизация на каждом проходе). Итого 16.6 + 4.5 + 0.2 =
+# 21.3 ГБ, ~2 ГБ остаётся на активации, offload не нужен.
+#
+# int8 выбран ещё и потому, что на Ampere он нативный, в отличие от fp8/nvfp4 —
+# те у наших карт идут эмуляцией (видно в логе ComfyUI на старте).
+#
+# ``cpu_offload`` остаётся как запасной путь: если квантованная модель всё же
+# не влезет, ставим True и получаем медленно, но работающе.
+IMAGE_MODELS = {
+    "z_image": {
+        "pipe_cls": ZImagePipeline,
+        "model_id": "Tongyi-MAI/Z-Image-Turbo",
+        "steps": 9,          # даёт 8 проходов DiT
+        "guidance": 0.0,     # для turbo-моделей guidance должен быть 0
+        "scheduler": None,
+        "cpu_offload": False,
+        "quantize": None,
+        "quant_backend": None,
+        "quant_kwargs": None,
+        # Стек LoRA: каждая со своим весом, применяются одновременно.
+        # Репозиторий смонтирован в /root, файлы лежат в ./loras и в гит не идут.
+        # Пустой список — работаем на голой модели.
+        #
+        # Z-Image НЕ отказывает на анатомии (проверено 13.09.2026 с выключенными
+        # LoRA) — эти нужны не чтобы «разблокировать», а чтобы она рисовала тела
+        # достовернее: база даёт неправдоподобные ареолы и совсем плохо
+        # справляется с мужской анатомией.
+        #
+        # Порядок и веса подобраны от общего к частному: сперва общий
+        # NSFW-реализм, поверх — точечные правки. Косплейная
+        # zimage_cos-NSFW-lora осталась в ./loras, но не подключена: она про
+        # костюмы, а не про анатомию.
+        # better-nipples на 0.5 — постоянно включена.
+        #
+        # Зачем: на КОРОТКИХ промптах вроде «boobs» описания нет, модель
+        # достраивает по своему приору, и он даёт огромные тёмные ареолы и
+        # пластиковую кожу. Ни позитивные уточнения, ни негатив с cfg этого не
+        # чинят (проверено на фиксированном сиде 13.09.2026) — а адаптер чинит.
+        #
+        # Почему именно 0.5 и почему всегда: на развёрнутых промптах эта сила
+        # практически не отличима от базы, на 1.0 уже видно (кожа глаже). На
+        # посторонних сюжетах — одетый портрет, пейзаж, предмет — при 0.5 ущерба
+        # нет, проверено попарно на одном сиде. То есть включать по условию
+        # (короткий промпт / длинный) смысла нет: 0.5 полезна там, где нужна, и
+        # безвредна там, где нет.
+        #
+        # Раньше здесь стоял стек из трёх адаптеров суммарным весом 1.7 — он
+        # ломал анатомию и уводил кожу в пластик. mystic-xxx-v7 и zpenis-v2
+        # лежат в ./loras, но по отдельности не проверены; чтобы испытать,
+        # дописать сюда запись и гонять через lora_only.
+        "lora_default_mult": 1.0,
+        # Выбор адаптера по словам промпта УБРАН: подстроки ненадёжны — промпт
+        # приходит и на русском, и без маркеров, и со словом «his» про женщину.
+        # Пока включена одна better-nipples; остальные загружены с нулевым весом
+        # и доступны для проверки через lora_only.
+        "lora": [
+            {"path": "/root/loras/better-nipples.safetensors", "scale": 0.5,
+             "name": "nipples"},
+            {"path": "/root/loras/mystic-xxx-v7.safetensors", "scale": 0.0,
+             "name": "mystic"},
+            {"path": "/root/loras/zpenis-v2.safetensors", "scale": 0.0,
+             "name": "zpenis"},
+        ],
+    },
+    # Файнтюн Z-Image с civitai. Чекпойнт содержит ТОЛЬКО трансформер (453
+    # тензора с префиксом model.diffusion_model), поэтому VAE, текст-энкодер и
+    # токенизатор берём из базового Tongyi-MAI/Z-Image-Turbo — он уже в кэше.
+    # Смысл захода: правки анатомии вплавлены в веса, значит не нужны ни стек
+    # LoRA, ни выбор адаптера по промпту.
+    "pornmaster": {
+        "pipe_cls": ZImagePipeline,
+        "model_id": "Tongyi-MAI/Z-Image-Turbo",
+        "transformer_file": "/root/checkpoints/pornmaster-v35-bf16.safetensors",
+        "steps": 9,
+        "guidance": 0.0,
+        "scheduler": None,
+        "cpu_offload": False,
+        "quantize": None,
+        "quant_backend": None,
+        "quant_kwargs": None,
+        "lora": [],
+        "lora_default_mult": 0.0,
+    },
+    "chroma_flash": {
+        "pipe_cls": ChromaPipeline,
+        "model_id": "lodestones/Chroma1-Flash",
+        # 20, а не 8. Автор обещает 8 шагов, но с решателем heun — тот второго
+        # порядка и делает два прохода на шаг. В diffusers heun недоступен:
+        # ChromaPipeline всегда сам строит сигмы, а FlowMatchHeunDiscreteScheduler
+        # кастомные сигмы не принимает. Со штатным euler (первый порядок) восьми
+        # шагов не хватает: ODE недоинтегрирована, картинка выходит вымытой и
+        # «живописной», вплоть до поддельной подписи художника в углу.
+        # Замер 12.09.2026 на одном промпте: 8 шагов — мыло, 20 — честное фото
+        # (31 с), 35 — чуть лучше (53 с). 20 взято как компромисс; клиент может
+        # переопределить полем "steps" в запросе, если нужно быстрее или лучше.
+        "steps": 20,
+        "guidance": 1.0,
+        # Автор Chroma советует heun, но это термин ComfyUI: в diffusers
+        # ChromaPipeline всегда сам строит сигмы и передаёт их планировщику, а
+        # FlowMatchHeunDiscreteScheduler кастомные сигмы не принимает и падает.
+        # Оставляем штатный FlowMatchEuler, с которым интеграция и писалась;
+        # если 8 шагов дадут грязь — поднимать steps, а не менять планировщик.
+        "scheduler": None,
+        "cpu_offload": False,
+        "quantize": ["text_encoder"],
+        # 4 бита, а не 8: с int8 энкодер занимал 4.5 ГБ, модель целиком 23.1 из
+        # 23.5 ГБ, и активациям не хватало ~2 ГБ (падало в apply_rotary_emb на
+        # 54 МБ). nf4 ужимает T5 до ~2.3 ГБ и освобождает нужный запас.
+        # Двойная квантизация (bnb_4bit_use_double_quant) снимает ещё немного,
+        # compute в bf16 — считать всё равно в полной точности.
+        "quant_backend": "bitsandbytes_4bit",
+        "quant_kwargs": {
+            "load_in_4bit": True,
+            "bnb_4bit_quant_type": "nf4",
+            "bnb_4bit_use_double_quant": True,
+            "bnb_4bit_compute_dtype": torch.bfloat16,
+        },
+        "lora": [],
+        "lora_default_mult": 0.0,
+    },
+}
+# Обратно на z_image: Chroma даёт анатомию, но её «живописный» приор перебить
+# не удалось — на простых промптах она уходит в иллюстрацию, а фотографичность
+# Z-Image недостижима. План: вернуть Z-Image и снять отказы через LoRA (см.
+# "lora" в реестре). Chroma остаётся доступной через IMAGE_MODEL=chroma_flash.
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "z_image")
 
 # Квантизация трансформеров Wan через bitsandbytes (4-бит NF4): ~7 ГБ/эксперт, оба
 # влезают в 24 ГБ. В отличие от torchao у bnb штатно работают save/load (быстрый
@@ -271,26 +444,97 @@ def _from_cache_first(cls, model_id, **kwargs):
 
 
 def _build_image_pipe():
+    """Поднимает картиночную модель, выбранную через IMAGE_MODEL."""
+    spec = IMAGE_MODELS[IMAGE_MODEL]
+
     # Use bfloat16 for optimal performance on supported GPUs
     # low_cpu_mem_usage=True — дефолт diffusers при установленном accelerate;
     # стоявший здесь False заставлял сперва собрать пустую модель в RAM, а потом
     # залить в неё state dict, то есть держать ~20 ГБ лишних и выбивать page cache
     # (после чего веса H3 перечитывались с диска на 15 МБ/с). На инференс не
-    # влияет — только на загрузку. Если Z-Image когда-то ломался без False,
-    # это вылезет сразу на первой загрузке.
+    # влияет — только на загрузку.
+    extra = {}
+    if spec["quantize"]:
+        # Квантуем на загрузке, а не после: bitsandbytes подменяет слои в момент
+        # материализации весов, постфактум модель уже не ужать.
+        extra["quantization_config"] = PipelineQuantizationConfig(
+            quant_backend=spec["quant_backend"],
+            quant_kwargs=spec["quant_kwargs"],
+            components_to_quantize=spec["quantize"],
+        )
+
+    tf_file = spec.get("transformer_file")
+    if tf_file:
+        # Трансформер из одиночного файла, остальное — из базового репозитория.
+        # Не упали, а предупредили и взяли базовый: чекпойнты лежат вне гита, и
+        # на свежей машине их может не быть. Лучше рисовать базой, чем не
+        # рисовать вообще.
+        if not os.path.exists(tf_file):
+            print(f"[img_gen] чекпойнт не найден: {tf_file} — "
+                  f"работаем на базовой модели", flush=True)
+        else:
+            try:
+                extra["transformer"] = ZImageTransformer2DModel.from_single_file(
+                    tf_file, torch_dtype=torch.bfloat16)
+            except Exception as e:
+                print(f"[img_gen] чекпойнт не загрузился ({type(e).__name__}: "
+                      f"{str(e)[:160]}) — работаем на базовой модели", flush=True)
+
     pipe = _from_cache_first(
-        ZImagePipeline,
-        "Tongyi-MAI/Z-Image-Turbo",
+        spec["pipe_cls"],
+        spec["model_id"],
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
+        **extra,
     )
-    if IMAGE_CPU_OFFLOAD:
+
+    # Низкошаговым весам нужен свой планировщик: Chroma-Flash обучена под heun,
+    # на дефолтном euler при 8 шагах картинку разносит.
+    if spec["scheduler"] is not None:
+        pipe.scheduler = spec["scheduler"].from_config(pipe.scheduler.config)
+
+    # Грузим адаптерами, а не fuse_lora: так веса можно менять на лету
+    # (lora_scale в запросе), не перезагружая модель. Каждая LoRA — отдельный
+    # адаптер со своим именем, diffusers складывает их поправки.
+    #
+    # Каждая под своим try: файлы лежат вне репозитория и приходят с civitai в
+    # формате kohya, который конвертер понимает не всегда. Отвалившаяся LoRA не
+    # должна ронять генерацию — просто работаем без неё.
+    loaded_loras = []
+    for item in (spec.get("lora") or []):
+        if not os.path.exists(item["path"]):
+            print(f"[img_gen] LoRA не найдена: {item['path']} — пропускаю",
+                  flush=True)
+            continue
+        try:
+            pipe.load_lora_weights(item["path"], adapter_name=item["name"])
+            loaded_loras.append(item)
+        except Exception as e:
+            print(f"[img_gen] LoRA {item['name']} не загрузилась "
+                  f"({type(e).__name__}: {str(e)[:160]}) — пропускаю", flush=True)
+
+    if loaded_loras:
+        pipe.set_adapters([i["name"] for i in loaded_loras],
+                          [i["scale"] for i in loaded_loras])
+        print("[img_gen] LoRA: " + ", ".join(
+            f"{i['name']}={i['scale']}" for i in loaded_loras), flush=True)
+
+    if spec["cpu_offload"] or IMAGE_CPU_OFFLOAD:
         # accelerate двигает модули по одному; в VRAM живёт самый большой из них
-        # плюс активации — это и покажет "peak VRAM" в логе инференса.
+        # плюс активации — это и покажет "peak VRAM" в логе инференса. Для Chroma
+        # раскладка удачная: T5 отрабатывает один раз за генерацию и уезжает,
+        # дальше 8 шагов крутится только трансформер.
         pipe.enable_model_cpu_offload()
     else:
+        # Квантованные компоненты bitsandbytes размещает сам на загрузке и
+        # переносить их запрещает; to() это знает и трогает только остальные.
         pipe.to("cuda")
-    return pipe, {}
+
+    print(f"[img_gen] модель {IMAGE_MODEL} ({spec['model_id']}), "
+          f"{spec['steps']} шагов, cfg {spec['guidance']}, "
+          f"offload={spec['cpu_offload'] or IMAGE_CPU_OFFLOAD}, "
+          f"quant={spec['quant_backend'] or 'нет'} {spec['quantize'] or ''}", flush=True)
+    return pipe, spec
 
 
 def _video_to_bytes(video, fps):
@@ -361,28 +605,87 @@ def _run_i2v(data):
 
 
 def _run_image(data):
-    pipe, _ = _get_pipe(ProcessType.IMAGE_GENERATION, _build_image_pipe)
+    pipe, spec = _get_pipe(ProcessType.IMAGE_GENERATION, _build_image_pipe)
+
+    # Сила LoRA на лету: подбирать её приходится на глаз, и пересобирать образ
+    # ради каждой пробы бессмысленно.
+    #
+    # Выставляем ВСЕГДА, а не только когда запрос её задал: пайплайн кэшируется
+    # между задачами, и заданная однажды сила иначе залипает на всех следующих
+    # запросах, включая чужие. Не задана — возвращаем дефолт из реестра.
+    # lora_scale в запросе — общий МНОЖИТЕЛЬ к весам из реестра, а не замена их
+    # одним числом: иначе потерялся бы подобранный баланс между адаптерами.
+    # 0 выключает стек целиком, 1 (по умолчанию) — веса как заданы.
+    #
+    # Выставляем ВСЕГДА, а не только когда запрос попросил: пайплайн кэшируется
+    # между задачами, и заданный однажды множитель иначе залипал бы на всех
+    # следующих запросах, включая чужие.
+    lora_mult = None
+    applied = ""
+    active = spec.get("lora") or []
+    if active and getattr(pipe, "get_active_adapters", None) and pipe.get_active_adapters():
+        lora_mult = getattr(data, "lora_scale", None)
+        if lora_mult is None:
+            lora_mult = spec.get("lora_default_mult", 0.0)
+
+        # lora_only в запросе — оставить включённой ровно одну LoRA по имени.
+        # Нужно, чтобы сравнивать их поодиночке: втроём они конфликтуют, и по
+        # общей картинке не понять, какая именно портит.
+        only = getattr(data, "lora_only", None)
+        by_name = {i["name"]: i["scale"] for i in active}
+        names = pipe.get_active_adapters()
+        weights = []
+        for n in names:
+            if only is not None:
+                # В режиме проверки вес берём ЦЕЛИКОМ из запроса, минуя реестр:
+                # иначе адаптер с нулём в реестре (испытуемый) так и остался бы
+                # выключенным, что уже однажды дало пустой прогон.
+                w = lora_mult if n == only else 0.0
+            else:
+                w = by_name.get(n, 1.0) * lora_mult
+            weights.append(w)
+        applied = ",".join(n for n, w in zip(names, weights) if w)
+        try:
+            pipe.set_adapters(names, weights)
+        except Exception as e:
+            print(f"[img_gen] set_adapters(x{lora_mult}) не удался: {e}", flush=True)
+            lora_mult = None
 
     t_inf = time.time()
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
+    seed = getattr(data, "seed", None)
+    if seed is None:
+        seed = random.randint(0, 2**32 - 1)
+
     image = pipe(
         prompt=data.prompt,
         height=896,
         width=1152,
-        num_inference_steps=9,  # This actually results in 8 DiT forwards
-        guidance_scale=0.0,     # Guidance should be 0 for the Turbo models
-        generator=torch.Generator("cuda").manual_seed(
-            random.randint(0, sys.maxsize)),
+        negative_prompt=getattr(data, "negative", None),
+        num_inference_steps=getattr(data, "steps", None) or spec["steps"],
+        guidance_scale=(spec["guidance"] if getattr(data, "guidance", None) is None
+                        else data.guidance),
+        generator=torch.Generator("cuda").manual_seed(seed),
     ).images[0]
 
     # 8 шагов Z-Image Turbo на 3090 — единицы секунд. Десятки/сотни секунд при
     # нормальном peak VRAM = карту делят или троттлит; peak ~0 = инференс уехал
     # на CPU (VRAM занял ComfyUI, /free не сработал).
     peak = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+    steps = getattr(data, "steps", None) or spec["steps"]
+    # lora в строке — чтобы по логу было видно, с какой силой считалась КАЖДАЯ
+    # картинка: значение приходит из запроса и глазами в картинке неразличимо.
+    only_note = f" only={data.lora_only}" if getattr(data, "lora_only", None) else ""
+    lora_note = ""
+    if lora_mult is not None:
+        lora_note = f" | lora x{lora_mult}{only_note} [{applied or 'нет'}]"
+    cfg = spec["guidance"] if getattr(data, "guidance", None) is None else data.guidance
+    neg_note = f" | cfg {cfg} neg«{str(data.negative)[:24]}»" if getattr(data, "negative", None) else ""
     print(f"[img_gen] inference: {time.time() - t_inf:.1f}s | peak VRAM {peak:.1f} GB "
-          f"| cuda={torch.cuda.is_available()}", flush=True)
+          f"| cuda={torch.cuda.is_available()} | {IMAGE_MODEL} | {steps} шагов"
+          f"{lora_note}{neg_note} | seed {seed}", flush=True)
     return image  # PIL.Image — в base64/PNG превращает host-сторона
 
 

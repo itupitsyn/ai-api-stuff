@@ -11,3 +11,4 @@ comfyui/output
 .claude
 docker-compose.override.yml
 comfyui/output-*
+loras
