@@ -81,8 +81,13 @@ class Item(BaseModel):
     steps: int | None = None
     guidance: float | None = None
     lora_scale: float | None = None
-    # Оставить включённой только эту LoRA по имени (nipples | mystic | zpenis).
+    # Оставить включённой только эту LoRA по имени
+    # (nipples | cosplay | mystic | zpenis).
     lora_only: str | None = None
+    # Вес каждой LoRA по отдельности: {"cosplay": 0.3}. Переопределяет реестр
+    # для названных, остальные берут своё. Нужно, чтобы подбирать баланс между
+    # адаптерами без пересборки — общий множитель lora_scale двигает все разом.
+    lora_weights: dict[str, float] | None = None
     # Негативный промпт. РАБОТАЕТ ТОЛЬКО при guidance > 0: у Z-Image
     # do_classifier_free_guidance == (guidance > 0), а дефолт для turbo — 0,
     # и тогда негатив молча игнорируется. Поднятие guidance удваивает счёт
@@ -201,11 +206,18 @@ IMAGE_MODELS = {
         "lora_default_mult": 1.0,
         # Выбор адаптера по словам промпта УБРАН: подстроки ненадёжны — промпт
         # приходит и на русском, и без маркеров, и со словом «his» про женщину.
-        # Пока включена одна better-nipples; остальные загружены с нулевым весом
-        # и доступны для проверки через lora_only.
+        # Включены две: better-nipples и косплейная. Друг другу не мешают (в
+        # отличие от zpenis, который тянул nipples на себя), и вторая не стоит
+        # почти ничего: пик VRAM тот же 24.2 ГБ, кадр 11.8 с против 11.7 с.
+        # Вес косплейной подобран перебором 0.3/0.5/1.0 на двух сидах: 0.5 —
+        # максимум, где костюм уже читается, а тело ещё целое; на 1.0 стиль
+        # продавливает анатомию. Остальные лежат с нулевым весом и доступны для
+        # проверки через lora_only или lora_weights.
         "lora": [
             {"path": "/root/loras/better-nipples.safetensors", "scale": 0.5,
              "name": "nipples"},
+            {"path": "/root/loras/zimage_cos-NSFW-lora.safetensors", "scale": 0.5,
+             "name": "cosplay"},
             {"path": "/root/loras/mystic-xxx-v7.safetensors", "scale": 0.0,
              "name": "mystic"},
             {"path": "/root/loras/zpenis-v2.safetensors", "scale": 0.0,
@@ -642,7 +654,9 @@ def _run_image(data):
                 # выключенным, что уже однажды дало пустой прогон.
                 w = lora_mult if n == only else 0.0
             else:
-                w = by_name.get(n, 1.0) * lora_mult
+                per = (getattr(data, "lora_weights", None) or {})
+                base = per[n] if n in per else by_name.get(n, 1.0)
+                w = base * lora_mult
             weights.append(w)
         applied = ",".join(n for n, w in zip(names, weights) if w)
         try:
