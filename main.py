@@ -13,6 +13,7 @@ import gc
 import traceback
 
 from diffusers import (ZImagePipeline, ZImageTransformer2DModel, ChromaPipeline, PipelineQuantizationConfig,
+                       QwenImageEditPlusPipeline,
                        WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline,
                        UniPCMultistepScheduler, WanTransformer3DModel, BitsAndBytesConfig)
 from diffusers.utils import export_to_video, load_image
@@ -53,6 +54,7 @@ huggingface_hub.hf_hub_download = patched_hf_hub_download
 
 class ProcessType(Enum):
     IMAGE_GENERATION = "img_gen"
+    IMAGE_EDIT = "img_edit"
     TRANSCRIPTION = "trans"
     T2V = 't2v'
     I2V = 'i2v'
@@ -286,6 +288,54 @@ IMAGE_MODELS = {
 # Z-Image недостижима. План: вернуть Z-Image и снять отказы через LoRA (см.
 # "lora" в реестре). Chroma остаётся доступной через IMAGE_MODEL=chroma_flash.
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "z_image")
+
+# ==========================================================================
+# Правка изображений по инструкции (/api/edit)
+# ==========================================================================
+# Отдельный реестр, а не запись в IMAGE_MODELS: тут другой смысл промпта и
+# другие параметры. Z-Image так НЕ умеет и не научится, пока не выложат веса
+# Omni — у неё второй картинке физически некуда попасть, в трансформер идут
+# голые латенты (проверено по исходнику 14.09.2026). Qwen-Image-Edit обучена
+# на парах «было → стало» и принимает список картинок как контекст.
+#
+# Промпт здесь — ИНСТРУКЦИЯ («сделай волосы рыжими»), а не описание кадра
+# целиком, как у txt2img. Это разные вещи, и путать их нельзя: описание кадра
+# модель тоже выполнит, но хуже.
+EDIT_MODELS = {
+    "qwen_edit": {
+        "pipe_cls": QwenImageEditPlusPipeline,
+        # Репозиторий уже квантован в nf4 — качать 15.8 ГиБ вместо 53.7 и не
+        # жать на загрузке (а на этой машине жать 20B в RAM ещё и рискованно).
+        "model_id": "ovedrive/Qwen-Image-Edit-2511-4bit",
+        # 4 шага, а не штатные 20: Lightning — дистилляция, воспроизводит
+        # длинную траекторию за несколько шагов. Замерено 14.09.2026 на четырёх
+        # задачах: 13 с против 57 с, качество то же, а вязка свитера на четырёх
+        # шагах даже рельефнее. Без LoRA поднимется на 20 (см. steps_no_lora).
+        "steps": 4,
+        "steps_no_lora": 20,
+        # CFG выключен намеренно. Включается условием negative_prompt is not
+        # None, то есть даже пустая строка его зажигает — и удваивает время.
+        # Проверено: с негативом и без него разница 3–6 единиц из 255, то есть
+        # уровень вариации, а не улучшения. 40 шагов вместо 20 тоже ничего не
+        # дали. Единственный рычаг, который сработал, — Lightning.
+        "negative_default": None,
+        "true_cfg": 4.0,
+        # Lightning тянется с HF при первом старте и кладётся в общий кэш.
+        # Не нашлась — работаем на 20 шагах, см. _build_edit_pipe.
+        "lora_repo": "lightx2v/Qwen-Image-Edit-2511-Lightning",
+        "lora_file": "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+        # NSFW-адаптеров здесь нет и быть не должно: на вход идут фотографии
+        # живых людей, которые загрузил пользователь. Реестр z_image со своими
+        # LoRA сюда не подмешивается — это отдельная модель со своим списком.
+    },
+}
+EDIT_MODEL = os.getenv("EDIT_MODEL", "qwen_edit")
+
+# Сколько картинок принимаем за раз и до какой площади ужимаем каждую.
+# Ограничения не косметические: на 1152×896 пик был 22.2 ГБ из 23.5 доступных,
+# и снимок с телефона в исходном размере эту карту положит.
+EDIT_MAX_IMAGES = 3
+EDIT_MAX_PIXELS = 1152 * 896
 
 # Квантизация трансформеров Wan через bitsandbytes (4-бит NF4): ~7 ГБ/эксперт, оба
 # влезают в 24 ГБ. В отличие от torchao у bnb штатно работают save/load (быстрый
@@ -549,6 +599,44 @@ def _build_image_pipe():
     return pipe, spec
 
 
+def _build_edit_pipe():
+    """Поднимает модель правки по инструкции (EDIT_MODEL)."""
+    spec = EDIT_MODELS[EDIT_MODEL]
+
+    # Веса в репозитории уже в nf4, PipelineQuantizationConfig не нужен:
+    # bitsandbytes читает свой quantization_config из конфигов компонентов.
+    pipe = _from_cache_first(
+        spec["pipe_cls"],
+        spec["model_id"],
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
+
+    # Lightning. Отдельный try по той же причине, что и у картиночных LoRA:
+    # адаптер живёт вне репозитория, и его отсутствие не должно ронять правку —
+    # без него просто считаем 20 шагов вместо четырёх.
+    steps = spec["steps_no_lora"]
+    if spec.get("lora_repo"):
+        try:
+            path = huggingface_hub.hf_hub_download(spec["lora_repo"], spec["lora_file"])
+            pipe.load_lora_weights(path, adapter_name="lightning")
+            pipe.set_adapters(["lightning"], [1.0])
+            steps = spec["steps"]
+            print(f"[img_edit] Lightning подключён, {steps} шагов", flush=True)
+        except Exception as e:
+            print(f"[img_edit] Lightning не загрузился ({type(e).__name__}: "
+                  f"{str(e)[:160]}) — работаем на {steps} шагах", flush=True)
+
+    # Квантованные компоненты bitsandbytes размещает сам; to() трогает остальные.
+    pipe.to("cuda")
+
+    spec = dict(spec, steps=steps)
+    print(f"[img_edit] модель {EDIT_MODEL} ({spec['model_id']}), {steps} шагов, "
+          f"cfg {'выкл' if spec['negative_default'] is None else spec['true_cfg']}",
+          flush=True)
+    return pipe, spec
+
+
 def _video_to_bytes(video, fps):
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         tmp_path = tmp.name
@@ -703,6 +791,54 @@ def _run_image(data):
     return image  # PIL.Image — в base64/PNG превращает host-сторона
 
 
+def _prep_edit_image(raw):
+    """Байты с телефона -> PIL под размер, который карта переживёт.
+
+    Ужимаем по ПЛОЩАДИ, сохраняя пропорции, и округляем стороны до кратности
+    32: VAE ужимает в 8 раз и потом патчит по 2, некратное приходится
+    подрезать, а подрезка съезжает на границе маски.
+    """
+    from PIL import Image
+
+    im = Image.open(BytesIO(raw)).convert("RGB")
+    w, h = im.size
+    scale = (EDIT_MAX_PIXELS / (w * h)) ** 0.5
+    if scale < 1:
+        w, h = int(w * scale), int(h * scale)
+    w, h = max(32, w // 32 * 32), max(32, h // 32 * 32)
+    return im.resize((w, h), Image.LANCZOS) if (w, h) != im.size else im
+
+
+def _run_image_edit(data):
+    pipe, spec = _get_pipe(ProcessType.IMAGE_EDIT, _build_edit_pipe)
+
+    images = [_prep_edit_image(b) for b in data["images"][:EDIT_MAX_IMAGES]]
+
+    t_inf = time.time()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    seed = data.get("seed")
+    if seed is None:
+        seed = random.randint(0, 2**32 - 1)
+
+    out = pipe(
+        image=images,
+        prompt=data["prompt"],
+        negative_prompt=spec["negative_default"],
+        num_inference_steps=data.get("steps") or spec["steps"],
+        true_cfg_scale=spec["true_cfg"],
+        generator=torch.Generator("cuda").manual_seed(seed),
+    ).images[0]
+
+    peak = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+    sizes = ",".join(f"{i.width}x{i.height}" for i in images)
+    print(f"[img_edit] inference: {time.time() - t_inf:.1f}s | peak VRAM {peak:.1f} GB "
+          f"| {EDIT_MODEL} | {data.get('steps') or spec['steps']} шагов "
+          f"| {len(images)} вход [{sizes}] | seed {seed}", flush=True)
+    return out
+
+
 def _run_transcription(data):
     # Транзиентно: whisperx грузит свои модели и освобождает после, видео-слот не трогаем.
     # Импорты ленивые — см. комментарий у секции импортов (тяжёлый аудио-стек,
@@ -786,6 +922,8 @@ def gpu_worker(job_q, res_q):
                 res = _run_i2v(data)
             elif ptype == ProcessType.IMAGE_GENERATION:
                 res = _run_image(data)
+            elif ptype == ProcessType.IMAGE_EDIT:
+                res = _run_image_edit(data)
             elif ptype == ProcessType.TRANSCRIPTION:
                 res = _run_transcription(data)
             else:
@@ -1057,7 +1195,7 @@ def worker(results, lock, card):
                     if filename and os.path.exists(filename):
                         os.unlink(filename)
 
-            elif type == ProcessType.IMAGE_GENERATION:
+            elif type in (ProcessType.IMAGE_GENERATION, ProcessType.IMAGE_EDIT):
                 res = gpu.submit_and_wait(job)
                 if isinstance(res, dict):  # {"error": ...}
                     with lock:
@@ -1147,6 +1285,45 @@ async def txt2img(item: Item):
         results[id] = {"status": Status.PENDING}
     enqueue_or_reject({"id": id, "type": ProcessType.IMAGE_GENERATION,
                        "data": item, "user": item.user})
+
+    return {"id": id}
+
+
+@app.post("/api/edit")
+async def edit(
+    files: list[UploadFile],
+    prompt: str = Form(...),
+    steps: int | None = Form(None),
+    seed: int | None = Form(None),
+    user: int | None = Form(None),
+):
+    """Правка изображений по инструкции. Одна картинка — правка, несколько —
+    микс: «возьми женщину со второго кадра и посади за верстак с первого».
+
+    prompt — ИНСТРУКЦИЯ, а не описание желаемого кадра. Это ровно наоборот к
+    /api/txt2img, и разница существенная: модель обучена на парах «было →
+    стало».
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="нужен хотя бы один файл")
+    if len(files) > EDIT_MAX_IMAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"максимум {EDIT_MAX_IMAGES} картинки, пришло {len(files)}")
+
+    id = str(uuid.uuid4())
+    print("edit", id, len(files), "файл(ов)")
+    # Читаем здесь, а не в воркере: UploadFile живёт только внутри запроса, а до
+    # GPU-процесса задача едет через pickle — туда должны уехать уже байты.
+    images = [await f.read() for f in files]
+    with lock:
+        results[id] = {"status": Status.PENDING}
+    enqueue_or_reject({
+        "id": id,
+        "type": ProcessType.IMAGE_EDIT,
+        "user": user,
+        "data": {"prompt": prompt, "images": images, "steps": steps, "seed": seed},
+    })
 
     return {"id": id}
 
