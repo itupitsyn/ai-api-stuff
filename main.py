@@ -37,6 +37,7 @@ from huggingface_hub.utils import http_backoff
 
 from scheduler import Scheduler
 from gpu_runner import GpuRunner
+import stats
 from comfy_client import (ComfyClient, MODELS as VIDEO_MODELS, DEFAULT_MODEL,
                           build_video_workflow, load_template, prepare_image,
                           template_name)
@@ -78,6 +79,12 @@ class Item(BaseModel):
     # другое значение не ускоряет генерацию, а меняет скорость воспроизведения.
     fps: int | None = None
     model: Literal[tuple(VIDEO_MODELS)] = DEFAULT_MODEL
+    # Сырой текст пользователя и выбранный ботом шаблон. На генерацию не
+    # влияют совсем: нужны для статистики и корпуса тест-кейсов, потому что
+    # сюда приезжает уже переведённый и обёрнутый в шаблон промпт, а по нему
+    # не видно, что человек написал на самом деле.
+    source_prompt: str | None = None
+    style: str | None = None
     # Переопределения для картинок; не заданы — берётся дефолт модели из
     # IMAGE_MODELS. Нужны, чтобы подбирать параметры без пересборки образа.
     steps: int | None = None
@@ -1114,6 +1121,65 @@ def _log_resources(card, tag):
           f" | swap_used {swap_used} MB", flush=True)
 
 
+def _stat_field(data, name):
+    """Одно поле задачи независимо от того, Item это или dict.
+
+    t2v и txt2img приходят объектом Item, остальные — словарём из формы.
+    """
+    if isinstance(data, dict):
+        return data.get(name)
+    return getattr(data, name, None)
+
+
+def _b64_size(payload):
+    """Размер исходных байт по длине base64, не раскодируя её.
+
+    Раскодировать ради одного числа было бы жалко: у видео это десятки
+    мегабайт на каждую задачу.
+    """
+    if not isinstance(payload, (bytes, bytearray)) or not payload:
+        return None
+    return len(payload) // 4 * 3 - payload[-2:].count(b"=")
+
+
+def _record_job(job, card, started, finished):
+    """Строка статистики о завершившейся задаче.
+
+    Исход читаем из results. Там его может уже не быть: /api/result удаляет
+    запись при первом же чтении, и дотошный клиент успевает забрать её раньше,
+    чем мы сюда дойдём. Окно крохотное, но существует, поэтому отсутствие
+    записи считаем успехом без размера, а не ошибкой.
+    """
+    id = job.get("id")
+    data = job.get("data")
+    with lock:
+        outcome = results.get(id) or {}
+    payload = outcome.get("data")
+    failed = outcome.get("status") == Status.ERROR
+    enqueued = job.get("ts", started)
+    stats.record(
+        job_id=id,
+        user_id=job.get("user"),
+        kind=job.get("type").value,
+        model=_stat_field(data, "model"),
+        width=_stat_field(data, "width"),
+        height=_stat_field(data, "height"),
+        fps=_stat_field(data, "fps"),
+        source_prompt=_stat_field(data, "source_prompt"),
+        prompt=_stat_field(data, "prompt"),
+        style=_stat_field(data, "style"),
+        enqueued_at=enqueued,
+        started_at=started,
+        finished_at=finished,
+        waited_s=started - enqueued,
+        duration_s=finished - started,
+        card=card.index,
+        status="error" if failed else "done",
+        error_class=(str(payload)[:200] if failed else None),
+        out_bytes=None if failed else _b64_size(payload),
+    )
+
+
 def worker(results, lock, card):
     """Поток обслуживания одной карты. Потоков столько же, сколько карт.
 
@@ -1149,6 +1215,8 @@ def worker(results, lock, card):
                 # ранний выход мимо try/finally ниже — место в допуске
                 # освобождаем здесь, иначе оно останется занятым навсегда
                 scheduler.finish(job)
+                now = time.time()
+                _record_job(job, card, now, now)
                 continue
 
         # На границе бэкендов освобождаем VRAM у того, кто её держал (одна карта):
@@ -1245,8 +1313,10 @@ def worker(results, lock, card):
             # задача досчитана (или упала) — освобождаем место под следующую
             # задачу этого человека
             scheduler.finish(job)
+            finished = time.time()
             print(f"[worker] done  {type.value} {id} |"
-                  f" total {time.time() - t_job:.1f}s", flush=True)
+                  f" total {finished - t_job:.1f}s", flush=True)
+            _record_job(job, card, t_job, finished)
             _log_resources(card, f"after  {type.value}")
 
 
@@ -1264,6 +1334,9 @@ current = {}
 async def lifespan(app: FastAPI):
     print(f"Карты: {cards} | потолок одновременных видео: "
           f"{scheduler.max_concurrent_video}", flush=True)
+
+    stats.init()
+    stats.start_exporter()
 
     for card in cards:
         card.gpu = GpuRunner(gpu_worker, device=card.index)
@@ -1400,6 +1473,9 @@ async def i2v(
     fps: int | None = Form(None),
     model: Literal[tuple(VIDEO_MODELS)] = Form(DEFAULT_MODEL),
     user: int | None = Form(None),
+    # см. комментарий у Item.source_prompt
+    source_prompt: str | None = Form(None),
+    style: str | None = Form(None),
 ):
     id = str(uuid.uuid4())
     print("i2v", id, model)
@@ -1411,7 +1487,8 @@ async def i2v(
         "type": ProcessType.I2V,
         "user": user,
         "data": {"prompt": prompt, "image": image, "width": width,
-                 "height": height, "fps": fps, "model": model},
+                 "height": height, "fps": fps, "model": model,
+                 "source_prompt": source_prompt, "style": style},
     })
 
     return {"id": id}
@@ -1502,6 +1579,14 @@ def get_queue():
         "worker_alive": any(c.thread is not None and c.thread.is_alive()
                             for c in cards),
     }
+
+
+@app.get("/api/stats")
+def get_stats(hours: int = 24):
+    """Сводка по задачам за окно. Источник — локальная база, не Postgres:
+    эндпоинт обязан отвечать, даже когда наблюдательная машина лежит.
+    """
+    return stats.summary(hours)
 
 
 @app.get("/api/result")
