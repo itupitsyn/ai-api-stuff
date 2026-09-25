@@ -1393,6 +1393,9 @@ async def edit(
     steps: int | None = Form(None),
     seed: int | None = Form(None),
     user: int | None = Form(None),
+    # см. комментарий у Item.source_prompt
+    source_prompt: str | None = Form(None),
+    style: str | None = Form(None),
 ):
     """Правка изображений по инструкции. Одна картинка — правка, несколько —
     микс: «возьми женщину со второго кадра и посади за верстак с первого».
@@ -1419,7 +1422,8 @@ async def edit(
         "id": id,
         "type": ProcessType.IMAGE_EDIT,
         "user": user,
-        "data": {"prompt": prompt, "images": images, "steps": steps, "seed": seed},
+        "data": {"prompt": prompt, "images": images, "steps": steps, "seed": seed,
+                 "source_prompt": source_prompt, "style": style},
     })
 
     return {"id": id}
