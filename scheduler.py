@@ -49,6 +49,10 @@ import threading
 import time
 
 
+# None как «узел не задан» не годится: это законный ключ локального узла.
+_UNSET = object()
+
+
 def user_of(job):
     """Владелец задачи.
 
@@ -167,22 +171,36 @@ def pick_user(pending, policy, *, max_user_batch):
 
 
 def startable(pending, video_types, *, video_running=0,
-              max_concurrent_video=None):
-    """Задачи, которые можно начать прямо сейчас.
+              max_concurrent_video=None, allowed_types=None,
+              video_allowed=None):
+    """Задачи, которые можно начать прямо сейчас на этой карте.
 
-    Отсекает видео, когда на пуле их уже считается ``max_concurrent_video``.
-    Ограничение общее на все карты, потому что упирается оно в оперативную
-    память, а не в GPU — подробности в доке модуля.
+    ``allowed_types`` — что карта вообще умеет. Карты пула перестали быть
+    однородными: у удалённой есть только чужой ComfyUI, а diffusers-процесса
+    там нет и быть не может, поэтому картинки и транскрипцию ей отдавать
+    нельзя. None — умеет всё, как было до нод.
+
+    ``video_allowed`` — готовое решение «можно ли начать видео», когда потолок
+    считается ПО УЗЛУ. Оперативная память принадлежит машине: на одном хосте
+    помещается два ролика, на другом один, и общего числа на пул больше не
+    существует. Задан — перекрывает расчёт по ``video_running``.
     """
-    if max_concurrent_video is None or video_running < max_concurrent_video:
-        return pending
+    ready = pending if allowed_types is None else [
+        j for j in pending if j["type"] in allowed_types]
 
-    return [j for j in pending if j["type"] not in video_types]
+    if video_allowed is None:
+        video_allowed = (max_concurrent_video is None
+                         or video_running < max_concurrent_video)
+    if video_allowed:
+        return ready
+
+    return [j for j in ready if j["type"] not in video_types]
 
 
 def pick_job(pending, video_types, policy, *, max_video_batch, max_wait_secs,
              max_videos_before_cheap, max_user_batch, device=None,
-             video_running=0, max_concurrent_video=None, now=None):
+             video_running=0, max_concurrent_video=None, now=None,
+             allowed_types=None, video_allowed=None):
     """Чистая функция выбора следующей задачи для карты ``device``.
 
     Возвращает выбранный элемент ``pending`` (не удаляя его) либо ``None``,
@@ -194,7 +212,8 @@ def pick_job(pending, video_types, policy, *, max_video_batch, max_wait_secs,
         now = time.time()
 
     ready = startable(pending, video_types, video_running=video_running,
-                      max_concurrent_video=max_concurrent_video)
+                      max_concurrent_video=max_concurrent_video,
+                      allowed_types=allowed_types, video_allowed=video_allowed)
     if not ready:
         return None
 
@@ -243,10 +262,20 @@ class Scheduler:
 
     def __init__(self, video_types, *, devices=(None,), max_video_batch=10,
                  max_wait_secs=900, max_videos_before_cheap=3, max_user_batch=2,
-                 max_user_inflight=5, max_concurrent_video=None):
+                 max_user_inflight=5, max_concurrent_video=None,
+                 device_nodes=None, node_video_caps=None, device_types=None):
         self.video_types = tuple(video_types)
         self.devices = tuple(devices)
         self.max_concurrent_video = max_concurrent_video
+        # Карта -> узел, на котором она стоит. Пусто — все карты на одной
+        # машине, и потолок остаётся общим на пул, как было до нод.
+        self.device_nodes = dict(device_nodes or {})
+        # Узел -> сколько видео он держит одновременно. Считается из его
+        # оперативной памяти, а не из числа карт.
+        self.node_video_caps = dict(node_video_caps or {})
+        # Карта -> что она умеет. Отсутствует для карты — умеет всё.
+        self.device_types = {k: frozenset(v)
+                             for k, v in (device_types or {}).items()}
         self.max_video_batch = max_video_batch
         self.max_wait_secs = max_wait_secs
         self.max_videos_before_cheap = max_videos_before_cheap
@@ -327,14 +356,19 @@ class Scheduler:
 
             self._cv.notify_all()
 
-    def _video_running(self, exclude=None):
+    def _video_running(self, exclude=None, node=_UNSET):
         """Сколько видео считается прямо сейчас (вызывать под ``self._cv``).
 
         Карту, которая как раз спрашивает себе работу, из счёта исключаем: она
         свободна, что бы там ни осталось в ``_running`` от прошлой задачи.
+
+        ``node`` задан — считаем только на этом узле: память принадлежит
+        машине, и ролики на соседнем хосте нашему ничем не мешают.
         """
         return sum(1 for device, job in self._running.items()
-                   if device != exclude and job["type"] in self.video_types)
+                   if device != exclude and job["type"] in self.video_types
+                   and (node is _UNSET
+                        or self.device_nodes.get(device) == node))
 
     def inflight_count(self, user):
         """Сколько задач этого пользователя сейчас в работе."""
@@ -372,7 +406,28 @@ class Scheduler:
             video_running=self._video_running(exclude=device),
             max_concurrent_video=self.max_concurrent_video,
             now=now,
+            allowed_types=self.device_types.get(device),
+            video_allowed=self._video_allowed(device),
         )
+
+    def _video_allowed(self, device):
+        """Можно ли этой карте начать видео (вызывать под ``self._cv``).
+
+        Два условия, и держаться должны оба: потолок узла (сколько роликов
+        влезает в память ЭТОЙ машины) и потолок пула, если он задан. Без
+        описания узлов возвращает None — тогда решает потолок пула, ровно как
+        было раньше.
+        """
+        node = self.device_nodes.get(device)
+        cap = self.node_video_caps.get(node)
+        if cap is None:
+            return None
+
+        if self._video_running(exclude=device, node=node) >= cap:
+            return False
+
+        pool = self.max_concurrent_video
+        return pool is None or self._video_running(exclude=device) < pool
 
     def service_order(self, now=None):
         """Порядок, в котором очередь будет разобрана, — прогон на копии.
@@ -435,6 +490,15 @@ class Scheduler:
                 },
                 "video_running": self._video_running(),
                 "max_concurrent_video": self.max_concurrent_video,
+                "nodes": {
+                    node: {
+                        "video_cap": cap,
+                        "video_running": self._video_running(node=node),
+                        "devices": [d for d in self.devices
+                                    if self.device_nodes.get(d) == node],
+                    }
+                    for node, cap in self.node_video_caps.items()
+                },
                 # три поля ниже — про первую карту; оставлены, чтобы не ломать
                 # тех, кто читал снимок до появления пула
                 "resident_vtype": self.resident_vtype,

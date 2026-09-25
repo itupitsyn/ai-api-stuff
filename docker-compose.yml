@@ -53,6 +53,9 @@ services:
       # генерация не должна зависеть от наблюдательной машины.
       - STATS_PG_DSN=${STATS_PG_DSN:-}
       - NODE_NAME=${NODE_NAME:-}
+      # Удалённые узлы пула: JSON-список {"name", "comfy"}. Адреса в .env,
+      # не здесь. Пусто — пул только из локальных карт, как было.
+      - VIDEO_NODES=${VIDEO_NODES:-[]}
       - PYTHONUNBUFFERED=1
       - HF_TOKEN=${HF_API_KEY} # берётся из .env в корне — снимает rate-limit при холодной закачке весов
       # Потолок на HEAD-запрос к huggingface.co при сверке ревизий (по умолчанию 10 с

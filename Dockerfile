@@ -26,7 +26,7 @@ RUN pip3 install -r requirements.txt
 # одну мелкую зависимость своим слоем.
 RUN pip3 install --no-cache-dir "psycopg[binary]"
 
-COPY .env main.py scheduler.py gpu_runner.py comfy_client.py stats.py ./
+COPY .env main.py scheduler.py gpu_runner.py comfy_client.py stats.py result_store.py ./
 COPY comfy_workflows ./comfy_workflows
 
 ENV PYTHONUNBUFFERED=1

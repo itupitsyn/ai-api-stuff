@@ -11,6 +11,8 @@ import tempfile
 import time
 import gc
 import traceback
+import json
+import requests
 
 from diffusers import (ZImagePipeline, ZImageTransformer2DModel, ChromaPipeline, PipelineQuantizationConfig,
                        QwenImageEditPlusPipeline,
@@ -38,6 +40,7 @@ from huggingface_hub.utils import http_backoff
 from scheduler import Scheduler
 from gpu_runner import GpuRunner
 import stats
+import result_store
 from comfy_client import (ComfyClient, MODELS as VIDEO_MODELS, DEFAULT_MODEL,
                           build_video_workflow, load_template, prepare_image,
                           template_name)
@@ -1003,43 +1006,78 @@ COMFYUI_URLS = [u for u in
 VIDEO_RAM_BUDGET_GB = 10
 
 
-def _max_concurrent_video(devices):
-    """Сколько видео тянет оперативка. Ограничение общее на пул.
+LOCAL_NODE = os.getenv("NODE_NAME") or "local"
 
-    Упирается не в карты, а в RAM: на 78 ГБ помещается одно видео, на 256 —
-    четыре. Считаем здесь, а не в планировщике: тот намеренно ничего не знает
-    ни про /proc, ни про железо. ``MAX_CONCURRENT_VIDEO`` в окружении
-    перекрывает расчёт, "0" снимает потолок совсем.
+# Удалённые узлы: JSON-список объектов {"name": ..., "comfy": "http://..."}.
+# Адреса — в окружении, не в коде.
+#
+# Почему адреса в конфиге, а узлы НЕ регистрируются сами: самозапись покупается
+# протоколом (endpoint регистрации, heartbeat, срок жизни записи,
+# аутентификация — иначе любой, кто достучится до сервиса, впишет себе узел в
+# пул), а на двух машинах не даёт ничего: адрес это одна строка. При этом
+# СПОСОБНОСТИ узел всё равно объявляет сам, см. _remote_ram_gb — память мы
+# спрашиваем у него.
+#
+# Тип узла определяется тем, что отвечает по адресу: говорит по-ComfyUI —
+# умеет только видео. Появится там наш воркер — появятся и остальные типы.
+try:
+    VIDEO_NODES = json.loads(os.getenv("VIDEO_NODES", "[]"))
+except ValueError as exc:
+    print(f"VIDEO_NODES не разобрался как JSON, удалённых узлов не будет: {exc}",
+          flush=True)
+    VIDEO_NODES = []
+
+
+def _node_video_cap(total_gb, cards):
+    """Сколько видео держит узел: по его памяти, но не больше числа карт."""
+    if not total_gb:
+        return 1
+
+    return max(1, min(int(total_gb // VIDEO_RAM_BUDGET_GB), cards))
+
+
+def _local_ram_gb():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal"):
+                    return int(line.split()[1]) / 1024 / 1024
+    except OSError:      # не Linux — на потолок не претендуем
+        return 0
+
+    return 0
+
+
+def _remote_ram_gb(comfy_url):
+    """Память удалённого узла — спрашиваем у его же ComfyUI.
+
+    Это и есть «узел объявляет свои способности», только без нового протокола:
+    /system_stats отдаёт ram_total, и потолок считается той же формулой, что у
+    локального. Не ответил — вернём 0, узел получит осторожный потолок в один
+    ролик и заработает, когда поднимется.
+    """
+    try:
+        r = requests.get(f"{comfy_url.rstrip('/')}/system_stats", timeout=10)
+        r.raise_for_status()
+        return r.json()["system"]["ram_total"] / 2 ** 30
+    except Exception as exc:
+        print(f"узел {comfy_url} не ответил про память ({exc}), потолок 1",
+              flush=True)
+        return 0
+
+
+def _pool_video_cap():
+    """Потолок видео на весь пул — теперь лишь страховка.
+
+    Решает потолок УЗЛА (память принадлежит машине), а это число — сумма
+    узловых, чтобы пул не обрезал их снизу. ``MAX_CONCURRENT_VIDEO`` в
+    окружении перекрывает расчёт, "0" снимает потолок совсем.
     """
     override = os.getenv("MAX_CONCURRENT_VIDEO")
     if override is not None:
         return int(override) or None
 
-    total_gb = 0
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemTotal"):
-                    total_gb = int(line.split()[1]) / 1024 / 1024
-                    break
-    except OSError:      # не Linux — на потолок не претендуем
-        return None
-
-    fits = int(total_gb // VIDEO_RAM_BUDGET_GB)
-    return max(1, min(fits, len(devices)))
-
-
-scheduler = Scheduler(
-    VIDEO_TYPES,
-    devices=tuple(GPU_DEVICES),
-    max_video_batch=MAX_VIDEO_BATCH,
-    max_wait_secs=MAX_WAIT_SECS,
-    max_videos_before_cheap=MAX_VIDEOS_BEFORE_CHEAP,
-    max_user_batch=MAX_USER_BATCH,
-    max_user_inflight=MAX_USER_INFLIGHT,
-    max_concurrent_video=_max_concurrent_video(GPU_DEVICES),
-)
-
+    return sum(NODE_VIDEO_CAPS.values()) or None
 
 class Card:
     """Одна карта пула: закреплённый за ней GPU-процесс и свой ComfyUI.
@@ -1047,20 +1085,77 @@ class Card:
     Соседние карты про неё ничего не знают: у каждой свой diffusers-процесс
     (привязан через CUDA_VISIBLE_DEVICES) и свой экземпляр ComfyUI, поэтому
     ни ``free()``, ни ``recycle()`` соседа не задевают.
+
+    Карты пула больше НЕ однородны. У локальной есть и ComfyUI, и свой
+    diffusers-процесс, поэтому она берёт любую задачу. У удалённой есть только
+    чужой ComfyUI: ``GpuRunner`` — дочерний процесс с CUDA_VISIBLE_DEVICES, то
+    есть по определению та же машина, и на чужой карте его не поднять. Значит
+    удалённая умеет видео и больше ничего.
     """
 
-    def __init__(self, index, comfy_url=None):
+    def __init__(self, index, comfy_url=None, node=None, can=None):
         self.index = index
+        self.node = node or LOCAL_NODE
+        # Ключ для планировщика и для current: номер карты уникален только
+        # внутри машины, а ключ обязан быть уникален в пуле.
+        self.key = f"{self.node}:{index}"
         self.comfy = ComfyClient(comfy_url)
-        self.gpu = None          # GpuRunner поднимается в lifespan
+        self.can = frozenset(can) if can else None   # None — умеет всё
+        self.gpu = None          # GpuRunner поднимается в lifespan; у удалённой нет
         self.thread = None
 
+    @property
+    def local(self):
+        return self.can is None
+
     def __repr__(self):
-        return f"<Card {self.index} comfy={self.comfy.base}>"
+        what = ("всё" if self.can is None
+                else ",".join(sorted(t.value for t in self.can)))
+        return f"<Card {self.key} comfy={self.comfy.base} умеет={what}>"
+
+
+def _remote_cards():
+    """Карты удалённых узлов: по одной на адрес ComfyUI.
+
+    У экземпляра ComfyUI ровно одна карта (--cuda-device принимает одну),
+    поэтому узел с одним адресом даёт одну карту.
+    """
+    out = []
+    for spec in VIDEO_NODES:
+        url = spec.get("comfy")
+        if not url:
+            print(f"узел без адреса comfy пропущен: {spec}", flush=True)
+            continue
+        out.append(Card(0, url, node=spec.get("name") or url, can=VIDEO_TYPES))
+
+    return out
 
 
 cards = [Card(index, COMFYUI_URLS[i] if i < len(COMFYUI_URLS) else None)
-         for i, index in enumerate(GPU_DEVICES)]
+         for i, index in enumerate(GPU_DEVICES)] + _remote_cards()
+
+# Потолок видео — ПО УЗЛУ: память принадлежит машине, общего числа на пул
+# больше не существует. Локальный считаем из /proc/meminfo, удалённый — из
+# того, что сказал его ComfyUI.
+NODE_VIDEO_CAPS = {LOCAL_NODE: _node_video_cap(_local_ram_gb(), len(GPU_DEVICES))}
+for _c in cards:
+    if _c.node != LOCAL_NODE and _c.node not in NODE_VIDEO_CAPS:
+        NODE_VIDEO_CAPS[_c.node] = _node_video_cap(_remote_ram_gb(_c.comfy.base), 1)
+
+scheduler = Scheduler(
+    VIDEO_TYPES,
+    devices=tuple(c.key for c in cards),
+    max_video_batch=MAX_VIDEO_BATCH,
+    max_wait_secs=MAX_WAIT_SECS,
+    max_videos_before_cheap=MAX_VIDEOS_BEFORE_CHEAP,
+    max_user_batch=MAX_USER_BATCH,
+    max_user_inflight=MAX_USER_INFLIGHT,
+    max_concurrent_video=_pool_video_cap(),
+    device_nodes={c.key: c.node for c in cards},
+    node_video_caps=NODE_VIDEO_CAPS,
+    # Только для карт с ограничениями: у локальных ограничений нет.
+    device_types={c.key: c.can for c in cards if c.can is not None},
+)
 
 _comfy_templates = {}
 
@@ -1115,7 +1210,9 @@ def _log_resources(card, tag):
     vram = card.comfy.vram_free_mb()
     m = _mem_snapshot()
     swap_used = (m.get("SwapTotal", 0) - m.get("SwapFree", 0)) or 0
-    print(f"[res] gpu{card.index} {tag} | vram_free {vram if vram is not None else '?'} MB"
+    # ram/swap здесь ЛОКАЛЬНЫЕ. Для удалённой карты это память нашего
+    # хоста, а не её — смотреть надо на vram_free, он спрошен у её ComfyUI.
+    print(f"[res] {card.key} {tag} | vram_free {vram if vram is not None else '?'} MB"
           f" | ram_avail {m.get('MemAvailable', '?')} MB"
           f" | cached {m.get('Cached', '?')} MB"
           f" | swap_used {swap_used} MB", flush=True)
@@ -1142,6 +1239,44 @@ def _b64_size(payload):
     return len(payload) // 4 * 3 - payload[-2:].count(b"=")
 
 
+def set_result(id, status, data=None):
+    """Единственная точка записи результата.
+
+    В память кладётся только статус, размер и текст ошибки; полезная
+    нагрузка живёт на диске. Иначе результат, который никто не забрал,
+    висит в памяти до перезапуска — чистка была ровно одна, при чтении из
+    /api/result, и ушедший пользователь оставлял мегабайт навсегда.
+
+    Не поднялось хранилище — держим нагрузку в памяти, как было раньше.
+    Тогда перезапуск её потеряет, но это не хуже прежнего поведения.
+    """
+    entry = {"status": status}
+    if isinstance(data, str):
+        entry["error"] = data
+    elif data is not None:
+        entry["size"] = _b64_size(data)
+    if not result_store.available():
+        entry["data"] = data
+
+    with lock:
+        results[id] = entry
+    result_store.put(id, status.value, data)
+
+
+def _result_sweeper():
+    """Убирает просроченное и из базы, и из памяти — иначе словарь помнил
+    бы статус задачи, чьей нагрузки давно нет."""
+    while True:
+        time.sleep(result_store.SWEEP_INTERVAL)
+        gone = result_store.sweep()
+        if not gone:
+            continue
+        with lock:
+            for job_id in gone:
+                results.pop(job_id, None)
+        print(f"[results] убрано по TTL: {len(gone)}", flush=True)
+
+
 def _record_job(job, card, started, finished):
     """Строка статистики о завершившейся задаче.
 
@@ -1154,7 +1289,6 @@ def _record_job(job, card, started, finished):
     data = job.get("data")
     with lock:
         outcome = results.get(id) or {}
-    payload = outcome.get("data")
     failed = outcome.get("status") == Status.ERROR
     enqueued = job.get("ts", started)
     stats.record(
@@ -1173,10 +1307,11 @@ def _record_job(job, card, started, finished):
         finished_at=finished,
         waited_s=started - enqueued,
         duration_s=finished - started,
+        node=card.node,
         card=card.index,
         status="error" if failed else "done",
-        error_class=(str(payload)[:200] if failed else None),
-        out_bytes=None if failed else _b64_size(payload),
+        error_class=(str(outcome.get("error"))[:200] if failed else None),
+        out_bytes=outcome.get("size"),
     )
 
 
@@ -1187,13 +1322,14 @@ def worker(results, lock, card):
     модель и свой бэкенд, и планировщик учитывает это отдельно.
     """
     gpu = card.gpu
-    print(f"Worker started on gpu{card.index}", flush=True)
+    print(f"Worker started on {card.key}"
+          f"{'' if card.local else ' (удалённая, только видео)'}", flush=True)
 
     loaded = None    # ProcessType в diffusers-процессе (для recycle при смене модели)
     backend = None   # "comfy" | "diffusers" — кто последним держал VRAM
 
     while True:
-        job = scheduler.next_job(card.index)
+        job = scheduler.next_job(card.key)
         if job is None:  # остановка
             break
 
@@ -1208,10 +1344,9 @@ def worker(results, lock, card):
         if type in VIDEO_TYPES and job_backend == "diffusers":
             requested = (data.model if type == ProcessType.T2V else data.get("model"))
             if (requested or DEFAULT_MODEL) != "wan":
-                with lock:
-                    results[id] = {"status": Status.ERROR, "data":
-                                   f"модель '{requested}' работает только через ComfyUI, "
-                                   f"а сейчас USE_COMFYUI=False"}
+                set_result(id, Status.ERROR,
+                           f"модель '{requested}' работает только через ComfyUI, "
+                           f"а сейчас USE_COMFYUI=False")
                 # ранний выход мимо try/finally ниже — место в допуске
                 # освобождаем здесь, иначе оно останется занятым навсегда
                 scheduler.finish(job)
@@ -1246,9 +1381,9 @@ def worker(results, lock, card):
               f" | backend {job_backend} | switch {switch:.1f}s", flush=True)
         _log_resources(card, f"before {type.value}")
         try:
+            set_result(id, Status.IN_PROGRESS)
             with lock:
-                results[id] = {"status": Status.IN_PROGRESS}
-                current[card.index] = {
+                current[card.key] = {
                     "id": id, "type": type, "backend": job_backend,
                     "user": job.get("user"), "started": time.time()}
 
@@ -1256,11 +1391,9 @@ def worker(results, lock, card):
             if job_backend == "comfy":
                 try:
                     res = _run_video_comfy(card, type, data)
-                    with lock:
-                        results[id] = {"status": Status.DONE, "data": base64.b64encode(res)}
+                    set_result(id, Status.DONE, base64.b64encode(res))
                 except Exception as e:
-                    with lock:
-                        results[id] = {"status": Status.ERROR, "data": str(e)}
+                    set_result(id, Status.ERROR, str(e))
                 continue
 
             # --- diffusers-бэкенд: смена модели внутри процесса → жёсткий сброс VRAM ---
@@ -1278,11 +1411,9 @@ def worker(results, lock, card):
                 try:
                     res = gpu.submit_and_wait(job)
                     if isinstance(res, dict) and res.get("error"):
-                        with lock:
-                            results[id] = {"status": Status.ERROR, "data": res.get("error")}
+                        set_result(id, Status.ERROR, res.get("error"))
                     else:
-                        with lock:
-                            results[id] = {"status": Status.DONE, "data": res}
+                        set_result(id, Status.DONE, res)
                 finally:
                     if filename and os.path.exists(filename):
                         os.unlink(filename)
@@ -1290,25 +1421,20 @@ def worker(results, lock, card):
             elif type in (ProcessType.IMAGE_GENERATION, ProcessType.IMAGE_EDIT):
                 res = gpu.submit_and_wait(job)
                 if isinstance(res, dict):  # {"error": ...}
-                    with lock:
-                        results[id] = {"status": Status.ERROR, "data": res.get("error")}
+                    set_result(id, Status.ERROR, res.get("error"))
                 else:
                     filtered_image = BytesIO()
                     res.save(filtered_image, "PNG")
                     filtered_image.seek(0)
-                    with lock:
-                        results[id] = {"status": Status.DONE,
-                                       "data": base64.b64encode(filtered_image.read())}
+                    set_result(id, Status.DONE,
+                               base64.b64encode(filtered_image.read()))
 
             else:  # T2V / I2V на diffusers (USE_COMFYUI=False, откат на nf4)
                 res = gpu.submit_and_wait(job)
                 if isinstance(res, dict):  # {"error": ...}
-                    with lock:
-                        results[id] = {"status": Status.ERROR, "data": res.get("error")}
+                    set_result(id, Status.ERROR, res.get("error"))
                 else:
-                    with lock:
-                        results[id] = {"status": Status.DONE,
-                                       "data": base64.b64encode(res)}
+                    set_result(id, Status.DONE, base64.b64encode(res))
         finally:
             # задача досчитана (или упала) — освобождаем место под следующую
             # задачу этого человека
@@ -1332,23 +1458,39 @@ current = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print(f"Карты: {cards} | потолок одновременных видео: "
+    print(f"Карты: {cards}", flush=True)
+    print(f"Потолок видео по узлам: {NODE_VIDEO_CAPS} | на пул: "
           f"{scheduler.max_concurrent_video}", flush=True)
 
     stats.init()
     stats.start_exporter()
 
+    if result_store.init():
+        restored, interrupted = result_store.recover()
+        with lock:
+            for job_id, saved in restored.items():
+                results[job_id] = {"status": Status(saved)}
+        print(f"[results] поднято из базы: {len(restored)}"
+              f" (оборвано перезапуском: {interrupted})", flush=True)
+        threading.Thread(target=_result_sweeper, daemon=True,
+                         name="result-sweeper").start()
+
     for card in cards:
-        card.gpu = GpuRunner(gpu_worker, device=card.index)
+        # Удалённой карте diffusers-процесс не поднять: GpuRunner привязывается
+        # через CUDA_VISIBLE_DEVICES, то есть только к своей машине. Ей и не
+        # нужен — она берёт исключительно видео, а его считает чужой ComfyUI.
+        if card.local:
+            card.gpu = GpuRunner(gpu_worker, device=card.index)
         card.thread = threading.Thread(target=worker, args=(results, lock, card),
-                                       daemon=True, name=f"worker-gpu{card.index}")
+                                       daemon=True, name=f"worker-{card.key}")
         card.thread.start()
 
     yield
 
     scheduler.stop()
     for card in cards:
-        card.gpu.stop()
+        if card.gpu is not None:
+            card.gpu.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1371,6 +1513,7 @@ def enqueue_or_reject(job):
 
     with lock:
         results.pop(job["id"], None)
+    result_store.delete(job["id"])
     raise HTTPException(status_code=429, detail=QUEUE_FULL_DETAIL)
 
 
@@ -1378,8 +1521,7 @@ def enqueue_or_reject(job):
 async def txt2img(item: Item):
     id = str(uuid.uuid4())
     print("img", id)
-    with lock:
-        results[id] = {"status": Status.PENDING}
+    set_result(id, Status.PENDING)
     enqueue_or_reject({"id": id, "type": ProcessType.IMAGE_GENERATION,
                        "data": item, "user": item.user})
 
@@ -1416,8 +1558,7 @@ async def edit(
     # Читаем здесь, а не в воркере: UploadFile живёт только внутри запроса, а до
     # GPU-процесса задача едет через pickle — туда должны уехать уже байты.
     images = [await f.read() for f in files]
-    with lock:
-        results[id] = {"status": Status.PENDING}
+    set_result(id, Status.PENDING)
     enqueue_or_reject({
         "id": id,
         "type": ProcessType.IMAGE_EDIT,
@@ -1442,8 +1583,7 @@ async def transcription(file: UploadFile, user: int | None = Form(None)):
     with open(filename, "wb") as f:
         f.write(file.file.read())
 
-    with lock:
-        results[id] = {"status": Status.PENDING}
+    set_result(id, Status.PENDING)
     try:
         enqueue_or_reject({"id": id, "type": ProcessType.TRANSCRIPTION,
                            "data": {"filename": filename}, "user": user})
@@ -1460,8 +1600,7 @@ async def transcription(file: UploadFile, user: int | None = Form(None)):
 async def t2v(item: Item):
     id = str(uuid.uuid4())
     print("t2v", id, item.model)
-    with lock:
-        results[id] = {"status": Status.PENDING}
+    set_result(id, Status.PENDING)
     enqueue_or_reject({"id": id, "type": ProcessType.T2V,
                        "data": item, "user": item.user})
 
@@ -1484,8 +1623,7 @@ async def i2v(
     id = str(uuid.uuid4())
     print("i2v", id, model)
     image = await file.read()
-    with lock:
-        results[id] = {"status": Status.PENDING}
+    set_result(id, Status.PENDING)
     enqueue_or_reject({
         "id": id,
         "type": ProcessType.I2V,
@@ -1514,9 +1652,9 @@ def get_queue():
         # забрали)
         running = {}
         for card in cards:
-            run = current.get(card.index)
+            run = current.get(card.key)
             if run and results.get(run["id"], {}).get("status") == Status.IN_PROGRESS:
-                running[card.index] = run
+                running[card.key] = run
 
         awaiting_pickup = sum(1 for r in results.values()
                               if r["status"] in (Status.DONE, Status.ERROR))
@@ -1526,11 +1664,14 @@ def get_queue():
         by_type[j["type"].value] = by_type.get(j["type"].value, 0) + 1
 
     def _card_state(card):
-        run = running.get(card.index)
-        dev = snap["devices"].get(card.index, {})
+        run = running.get(card.key)
+        dev = snap["devices"].get(card.key, {})
         resident = dev.get("resident_vtype")
 
         return {
+            "node": card.node,
+            "can": (None if card.can is None
+                    else sorted(t.value for t in card.can)),
             "comfy": card.comfy.base,
             "alive": card.thread is not None and card.thread.is_alive(),
             "resident_vtype": resident.value if resident else None,
@@ -1546,11 +1687,13 @@ def get_queue():
         }
 
     return {
-        # Что считает каждая карта. Ключ — её номер в GPU_DEVICES.
-        "devices": {card.index: _card_state(card) for card in cards},
+        # Что считает каждая карта. Ключ — "узел:номер": номер уникален
+        # только внутри машины, а в пуле теперь несколько машин.
+        "devices": {card.key: _card_state(card) for card in cards},
+        "nodes": snap.get("nodes", {}),
         # Первая занятая карта — чтобы старые читатели снимка не сломались.
         "running": next((_card_state(c)["running"] for c in cards
-                         if running.get(c.index)), None),
+                         if running.get(c.key)), None),
         # В порядке ОБСЛУЖИВАНИЯ, а не постановки: очередь не FIFO — порядок
         # задают круг по людям и батчинг. Бот по этому списку считает «ты N-й»,
         # так что хронология тут была бы враньём.
@@ -1590,19 +1733,32 @@ def get_stats(hours: int = 24):
     """Сводка по задачам за окно. Источник — локальная база, не Postgres:
     эндпоинт обязан отвечать, даже когда наблюдательная машина лежит.
     """
-    return stats.summary(hours)
+    out = stats.summary(hours)
+    with lock:
+        out["results_held"] = len(results)
+    out["results_db_bytes"] = result_store.size_bytes()
+    return out
 
 
 @app.get("/api/result")
 def get_result(id: str):
-    response = None
-    with lock:
-        response = results.get(id)
-        if response == None:
-            response = Response(status_code=404, content="")
-        else:
-            status = response.get("status")
-            if status == Status.DONE or status == Status.ERROR:
-                del results[id]
+    """Отдаёт результат задачи.
 
-    return response
+    Запись НЕ удаляется при чтении, как было раньше. Тот вариант терял
+    готовую работу навсегда, если ответ не доехал до клиента: повторный
+    запрос получал 404, хотя результат существовал. Теперь запись живёт до
+    TTL, и обрыв связи стоит одного повторного запроса, а не трёх минут
+    счёта на карте.
+    """
+    with lock:
+        entry = results.get(id)
+    if entry is None:
+        return Response(status_code=404, content="")
+
+    status = entry["status"]
+    if status not in (Status.DONE, Status.ERROR):
+        return {"status": status}
+
+    data = entry["data"] if "data" in entry else result_store.fetch_payload(id)
+    result_store.mark_collected(id)
+    return {"status": status, "data": data}
