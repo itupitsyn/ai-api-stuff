@@ -20,6 +20,7 @@
 не поведением клиента, а временем, и это предсказуемо.
 """
 
+import json
 import os
 import sqlite3
 import threading
@@ -35,14 +36,22 @@ SWEEP_INTERVAL = int(os.getenv("RESULT_SWEEP_INTERVAL", "600"))
 RESTART_MESSAGE = ("сервис перезапускался, пока задача считалась — "
                    "повторите запрос")
 
+# Вид нагрузки в столбце payload_text (см. комментарий в схеме).
+KIND_BYTES, KIND_TEXT, KIND_JSON = 0, 1, 2
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS results (
     id           TEXT PRIMARY KEY,
     status       TEXT NOT NULL,
     payload      BLOB,
-    -- payload у готовой задачи это base64-байты, у упавшей — текст ошибки.
-    -- Флаг нужен, чтобы отдать их обратно тем же типом, каким они были в
-    -- памяти: бот ждёт от data строку в одном случае и base64 в другом.
+    -- Вид нагрузки, чтобы отдать её обратно ТЕМ ЖЕ типом, каким она была в
+    -- памяти: бот ждёт от data base64 у картинки и видео, строку у ошибки и
+    -- объект у транскрипции.
+    --   0 — base64-байты (картинка, видео)
+    --   1 — текст (сообщение об ошибке)
+    --   2 — JSON (транскрипция отдаёт dict с сегментами)
+    -- Имя столбца историческое: переименование стоило бы миграции, а смысл
+    -- описан здесь.
     payload_text INTEGER NOT NULL DEFAULT 0,
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL,
@@ -91,8 +100,17 @@ def put(job_id, status, payload=None):
     if _conn is None:
         return
     try:
-        is_text = isinstance(payload, str)
-        blob = payload.encode("utf-8") if is_text else payload
+        # Без этой развилки dict от транскрипции уходил в sqlite как есть,
+        # ловил InterfaceError, писался только в лог — и результат терялся
+        # молча: в памяти оставался статус без данных, и /api/result отдавал
+        # боту data: null на КАЖДУЮ расшифровку.
+        if isinstance(payload, str):
+            kind, blob = KIND_TEXT, payload.encode("utf-8")
+        elif payload is None or isinstance(payload, (bytes, bytearray)):
+            kind, blob = KIND_BYTES, payload
+        else:
+            kind = KIND_JSON
+            blob = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         now = time.time()
         with _lock:
             _conn.execute(
@@ -104,7 +122,7 @@ def put(job_id, status, payload=None):
                 "   payload = excluded.payload,"
                 "   payload_text = excluded.payload_text,"
                 "   updated_at = excluded.updated_at",
-                (job_id, status, blob, int(is_text), now, now))
+                (job_id, status, blob, kind, now, now))
             _conn.commit()
     except Exception as e:
         _log(f"не записал результат {job_id}", e)
@@ -125,7 +143,18 @@ def fetch_payload(job_id):
 
     if row is None or row[0] is None:
         return None
-    return row[0].decode("utf-8") if row[1] else row[0]
+
+    kind = row[1]
+    if kind == KIND_TEXT:
+        return row[0].decode("utf-8")
+    if kind == KIND_JSON:
+        try:
+            return json.loads(row[0].decode("utf-8"))
+        except ValueError as e:
+            _log(f"не разобрал JSON результата {job_id}", e)
+            return None
+
+    return row[0]
 
 
 def mark_collected(job_id):

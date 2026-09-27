@@ -1,26 +1,53 @@
 --extra-index-url https://download.pytorch.org/whl/cu126
-accelerate
-peft
-ftfy
+
+# Версии прибиты гвоздями осознанно. До 27.09.2026 половина строк стояла без
+# пинов, и любая пересборка образа заново разрешала transformers, whisperx и
+# diffusers — то есть была лотереей. Сборка от 12.09.2026 при этом оказалась на
+# шесть дней старше, чем нужно для Qwen-Image 2.1, и догнать её точечно было
+# нельзя: пересборка слоя тянет ВСЁ. Поэтому здесь снимок состава, на котором
+# сервис проверен, а обновление любой строки — отдельное осознанное действие.
+#
+# Как поднять версию: поменять пин, пересобрать образ, прогнать генерацию
+# картинки, видео и расшифровки. Откат — вернуть прежний пин.
+
+accelerate==1.15.0
+peft==0.20.0
+ftfy==6.3.1
+
 torch==2.11.0
 torchaudio==2.11.0
 torchvision==0.26.0
-torchcodec>=0.14,<0.15  # ABI-совместим с torch 2.11
-pyannote.audio>=4.0
-omegaconf
-fastapi[standard]
-transformers
+torchcodec==0.14.0  # ABI-совместим с torch 2.11
+
+pyannote.audio==4.0.7
+omegaconf==2.3.1
+fastapi[standard]==0.141.1
+
+transformers==5.17.0
 # Токенизатор T5 у Chroma лежит как spiece.model — нужен sentencepiece, а
 # protobuf требуется его конвертеру в быстрый токенизатор. tiktoken добавлен
 # потому, что без sentencepiece transformers падает именно с требованием
 # tiktoken (сообщение вводит в заблуждение, но пусть будет оба бэкенда).
-sentencepiece
-protobuf
-tiktoken
-whisperx
-dotenv
-bitsandbytes  # nf4-квантизация Wan для diffusers-отката (USE_COMFYUI=False)
-requests  # HTTP-клиент к ComfyUI
-imageio
-imageio-ffmpeg
-git+https://github.com/huggingface/diffusers
+sentencepiece==0.2.2
+protobuf==7.36.1
+tiktoken==0.14.0
+
+whisperx==3.4.2
+dotenv==0.9.9
+python-dotenv==1.2.3
+bitsandbytes==0.50.2  # nf4 для текст-энкодеров Chroma и Qwen-Image 2.1
+requests==2.34.2  # HTTP-клиент к ComfyUI
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+
+# Экспорт статистики в Postgres на наблюдательной машине. Раньше ставился
+# отдельным слоем Dockerfile, чтобы правка requirements не инвалидировала слой
+# с torch и diffusers. После перехода на полные пины смысл пропал: пересборка
+# теперь воспроизводима, и держать зависимость на отшибе незачем.
+psycopg[binary]==3.3.6
+
+# Релиза с Qwen-Image 2.1 на PyPI нет: модель влили в main 18.09.2026
+# (#14804), поддержку одиночных файлов и GGUF 23.09 (#14836), LoRA 24.09
+# (#14808). Поэтому коммит, а не версия. Здесь зафиксирован main на
+# 26.09.2026 — в нём есть все три.
+git+https://github.com/huggingface/diffusers@e0abab83b5df05de9e7abd788643c1a7c1e42e28

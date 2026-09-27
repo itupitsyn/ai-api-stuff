@@ -3,6 +3,8 @@
 Не тянут torch/diffusers — проверяют чистую логику батчинга и анти-старвейшна.
 Запуск:  pytest test_scheduler.py -v
 """
+import time
+
 from scheduler import Policy, Scheduler, pick_job, pick_user
 
 # Типы задач в тестах — простые строки; настоящий main.py передаёт ProcessType.
@@ -605,3 +607,38 @@ def test_snapshot_reports_every_card():
     assert snap["devices"]["b"]["resident_vtype"] is None
     assert snap["video_running"] == 1
     assert snap["max_concurrent_video"] == 1
+
+def test_enqueue_wakes_every_waiting_card():
+    """Постановка задачи будит все карты, а не одну случайную.
+
+    Регрессия: карты пула не взаимозаменяемы — удалённая умеет только видео.
+    Condition.notify() будит того, кто ждёт дольше всех; если это она, а в
+    очередь легла картинка, она не берёт ничего и засыпает снова, потратив
+    единственное уведомление. Картинка висела в очереди при свободном пуле —
+    на живом сервисе 313 с. Поэтому видео-только карта тут встаёт в ожидание
+    ПЕРВОЙ: так тест ловит именно потерянное уведомление.
+    """
+    import threading
+
+    s = make_scheduler(devices=("video-only", "any"),
+                       device_types={"video-only": VIDEO})
+    got = {}
+
+    def wait_on(device):
+        got[device] = s.next_job(device)
+
+    first = threading.Thread(target=wait_on, args=("video-only",), daemon=True)
+    first.start()
+    time.sleep(0.2)          # она уже в next_job и ждёт дольше всех
+    second = threading.Thread(target=wait_on, args=("any",), daemon=True)
+    second.start()
+    time.sleep(0.2)
+
+    s.enqueue(job(IMG, 1))
+    second.join(timeout=5)
+
+    # картинку взяла универсальная карта, видео-только осталась ждать
+    assert got.get("any") is not None, "картинка не досталась никому"
+    assert got["any"]["id"] == "img-1"
+    assert "video-only" not in got
+    s.stop()

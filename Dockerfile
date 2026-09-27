@@ -16,15 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpython3.10 \
     git
 
+# Один слой на все зависимости. Раньше psycopg ставился отдельно, чтобы правка
+# requirements.txt не инвалидировала слой с torch и diffusers: тот тянул
+# diffusers из git без версии, и пересборка была лотереей. С 27.09.2026 в
+# requirements.txt прибито всё, включая коммит diffusers, — пересборка
+# воспроизводима, и дробить слои больше незачем.
 COPY requirements.txt .
 RUN pip3 install -r requirements.txt
-
-# psycopg отдельной строкой, а НЕ в requirements.txt: тот участвует в COPY
-# выше, и любая его правка инвалидирует слой с torch, whisperx и diffusers.
-# Последний ставится из git без закрепления версии, так что пересборка того
-# слоя — это ещё и лотерея с новым diffusers. Дешевле и безопаснее довезти
-# одну мелкую зависимость своим слоем.
-RUN pip3 install --no-cache-dir "psycopg[binary]"
 
 COPY .env main.py scheduler.py gpu_runner.py comfy_client.py stats.py result_store.py ./
 COPY comfy_workflows ./comfy_workflows

@@ -15,7 +15,7 @@ import json
 import requests
 
 from diffusers import (ZImagePipeline, ZImageTransformer2DModel, ChromaPipeline, PipelineQuantizationConfig,
-                       QwenImageEditPlusPipeline,
+                       QwenImageEditPlusPipeline, QwenImage21Pipeline,
                        WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline,
                        UniPCMultistepScheduler, WanTransformer3DModel, BitsAndBytesConfig)
 from diffusers.utils import export_to_video, load_image
@@ -76,6 +76,11 @@ class Item(BaseModel):
     # Владелец задачи: по нему считается потолок и строится круг обслуживания.
     # Не задан — задача попадает к общему анонимному пользователю.
     user: int | None = None
+    # Размер кадра. Относится ТОЛЬКО к видео: у картинок он берётся из
+    # реестра ("size" в IMAGE_MODELS), потому что у каждой модели свои
+    # удобные кратности. Бот его для картинок и не присылает — до
+    # 27.09.2026 в статистику из-за этого попадали вот эти дефолтные
+    # 832×480, которых ни одна картинка никогда не имела.
     width: int = 832
     height: int = 480
     # fps не задан → берётся дефолт модели (Wan 30, H3 24). У H3 24 fps нативные:
@@ -173,6 +178,10 @@ IMAGE_CPU_OFFLOAD = False
 #
 # ``cpu_offload`` остаётся как запасной путь: если квантованная модель всё же
 # не влезет, ставим True и получаем медленно, но работающе.
+# Размер картинки по умолчанию. Был зашит числами прямо в вызов пайплайна;
+# модель может переопределить его полем "size".
+IMAGE_SIZE_DEFAULT = (1152, 896)
+
 IMAGE_MODELS = {
     "z_image": {
         "pipe_cls": ZImagePipeline,
@@ -292,12 +301,65 @@ IMAGE_MODELS = {
         "lora": [],
         "lora_default_mult": 0.0,
     },
+    # Qwen-Image 2.1: 7B DiT плюс Qwen3-VL-8B в роли текст-энкодера.
+    #
+    # Зачем перешли (замер 27.09.2026 на реальных промптах бота): текст ВНУТРИ
+    # картинки. Половина трафика — мемы с подписями, и Z-Image врёт в буквах
+    # почти всегда (rephase, idenifying, notition), а эта набирает дословно.
+    # Заодно честнее следует промпту: «подводная лодка в небе» у Z-Image
+    # оказывалась под водой. Скорость при равном числе пикселей та же.
+    #
+    # Квантуем ОБА компонента. Сперва пробовали резать только энкодер, оставив
+    # трансформер в bf16 — не влезло: процесс занимал 23.4 ГБ из 23.56, и
+    # генерация падала на CUDA OOM, не дотянув 284 МБ (27.09.2026). Арифметика:
+    # трансформер 6.6B в bf16 это 13.2 ГБ, энкодер в nf4 ещё 5, VAE 0.6, плюс
+    # резерв аллокатора и активации.
+    #
+    # С nf4 на обоих выходит около 9 ГБ и запас на активации остаётся. Что
+    # делать, если пострадает качество букв — ради которых мы сюда и шли:
+    # взять 8 бит на трансформер. В ComfyUI мы мерили именно int8 (14 с на
+    # мегапиксель, текст дословный), так что формат проверен; в diffusers для
+    # этого нужен GGUF Q8 через from_single_file плюс пакет gguf в
+    # requirements. Третий путь — cpu_offload=True: пик падает до ~14 ГБ без
+    # квантизации вообще, но веса едут через PCIe на каждую картинку, а в RAM
+    # их держат ДВА процесса (по одному на карту), то есть 36 ГБ из 60.
+    #
+    # 25 шагов, а не 40 из доки: столько стоит в официальном шаблоне ComfyUI,
+    # и на замере разницы с 40 не видно.
+    #
+    # guidance_arg: у этого пайплайна НЕТ guidance_scale, вместо него
+    # true_cfg_scale. Единица = один проход на шаг; больше единицы включает
+    # classifier-free guidance и удваивает счёт, зато начинает работать
+    # негативный промпт.
+    "qwen21": {
+        "pipe_cls": QwenImage21Pipeline,
+        "model_id": "Qwen/Qwen-Image-2.1",
+        "steps": 25,
+        "guidance": 1.0,
+        "guidance_arg": "true_cfg_scale",
+        "size": (1152, 896),
+        "scheduler": None,
+        "cpu_offload": False,
+        "quantize": ["transformer", "text_encoder"],
+        "quant_backend": "bitsandbytes_4bit",
+        "quant_kwargs": {
+            "load_in_4bit": True,
+            "bnb_4bit_quant_type": "nf4",
+            "bnb_4bit_use_double_quant": True,
+            "bnb_4bit_compute_dtype": torch.bfloat16,
+        },
+        "lora": [],
+        "lora_default_mult": 0.0,
+    },
 }
 # Обратно на z_image: Chroma даёт анатомию, но её «живописный» приор перебить
 # не удалось — на простых промптах она уходит в иллюстрацию, а фотографичность
 # Z-Image недостижима. План: вернуть Z-Image и снять отказы через LoRA (см.
 # "lora" в реестре). Chroma остаётся доступной через IMAGE_MODEL=chroma_flash.
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "z_image")
+# С 27.09.2026 по умолчанию qwen21 — см. комментарий у его записи в реестре.
+# Z-Image остаётся доступной через IMAGE_MODEL=z_image: она по-прежнему даёт
+# более красивый кадр там, где текста в картинке нет.
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "qwen21")
 
 # ==========================================================================
 # Правка изображений по инструкции (/api/edit)
@@ -771,15 +833,25 @@ def _run_image(data):
     if seed is None:
         seed = random.randint(0, 2**32 - 1)
 
+    # Размер берётся из реестра, а не из запроса: width/height в Item описывают
+    # видео, у картинок они никогда не применялись. У разных моделей свои
+    # удобные кратности, поэтому значение лежит рядом с моделью.
+    width, height = spec.get("size", IMAGE_SIZE_DEFAULT)
+
+    # Имя аргумента силы подсказки тоже разное: у Z-Image и Chroma это
+    # guidance_scale, у Qwen-Image 2.1 — true_cfg_scale, и лишний ключ пайплайн
+    # не проглотит, а уронит запрос.
+    guidance = (spec["guidance"] if getattr(data, "guidance", None) is None
+                else data.guidance)
+
     image = pipe(
         prompt=data.prompt,
-        height=896,
-        width=1152,
+        height=height,
+        width=width,
         negative_prompt=getattr(data, "negative", None),
         num_inference_steps=getattr(data, "steps", None) or spec["steps"],
-        guidance_scale=(spec["guidance"] if getattr(data, "guidance", None) is None
-                        else data.guidance),
         generator=torch.Generator("cuda").manual_seed(seed),
+        **{spec.get("guidance_arg", "guidance_scale"): guidance},
     ).images[0]
 
     # 8 шагов Z-Image Turbo на 3090 — единицы секунд. Десятки/сотни секунд при
@@ -1287,6 +1359,25 @@ def _record_job(job, card, started, finished):
     """
     id = job.get("id")
     data = job.get("data")
+    kind = job.get("type")
+
+    # Чем и в каком размере считали. Из запроса это брать нельзя: поле model в
+    # Item описывает ВИДЕО-модель и у картинок всегда равно видеодефолту, а
+    # width/height у картинок не применяются вовсе — размер берётся из реестра.
+    # До 27.09.2026 в статистике у всех картинок стояло minimax_h3 и 832×480,
+    # которых никогда не было.
+    model = _stat_field(data, "model")
+    width = _stat_field(data, "width")
+    height = _stat_field(data, "height")
+    if kind == ProcessType.IMAGE_GENERATION:
+        model = IMAGE_MODEL
+        width, height = IMAGE_MODELS[IMAGE_MODEL].get("size", IMAGE_SIZE_DEFAULT)
+    elif kind == ProcessType.IMAGE_EDIT:
+        # Размер у правки задаёт исходная картинка, а не мы.
+        model, width, height = EDIT_MODEL, None, None
+    elif kind == ProcessType.TRANSCRIPTION:
+        model, width, height = None, None, None
+
     with lock:
         outcome = results.get(id) or {}
     failed = outcome.get("status") == Status.ERROR
@@ -1294,10 +1385,10 @@ def _record_job(job, card, started, finished):
     stats.record(
         job_id=id,
         user_id=job.get("user"),
-        kind=job.get("type").value,
-        model=_stat_field(data, "model"),
-        width=_stat_field(data, "width"),
-        height=_stat_field(data, "height"),
+        kind=kind.value,
+        model=model,
+        width=width,
+        height=height,
         fps=_stat_field(data, "fps"),
         source_prompt=_stat_field(data, "source_prompt"),
         prompt=_stat_field(data, "prompt"),
