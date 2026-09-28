@@ -34,7 +34,11 @@ NODE = os.getenv("NODE_NAME") or os.uname().nodename
 # Порядок колонок задан один раз и используется и при вставке, и при экспорте:
 # разъехавшись, они молча перепутали бы значения местами.
 COLUMNS = (
-    "job_id", "user_id", "kind", "model",
+    # chat_id — ЧАТ, откуда пришла задача, а не человек. Единица жизни у бота
+    # именно чат: он живёт в группах, и «12 пользователей» может означать и
+    # один чат, и десять. Без этого поля непонятно, где им пользуются каждый
+    # день, а где он давно молчит. У задач из лички равен id человека.
+    "job_id", "user_id", "chat_id", "kind", "model",
     "width", "height", "frames", "fps",
     # source_prompt и style заполняет бот; до его доработки остаются пустыми
     "source_prompt", "prompt", "style",
@@ -42,10 +46,17 @@ COLUMNS = (
     "node", "card", "status", "error_class", "out_bytes",
 )
 
-_SCHEMA = """
+# Таблица и индексы разведены намеренно. Индексы строятся ПОСЛЕ миграции
+# колонок: у базы, заведённой прежней версией, новой колонки ещё нет, а
+# executescript падает целиком на первом же несуществующем имени — вместе с
+# ним отключается весь учёт. Поймано на живом сервисе 28.09.2026 при добавлении
+# chat_id. Правило: новая колонка идёт в _TABLE и в COLUMNS, её индекс — в
+# _INDEXES, и порядок в init() это разруливает сам.
+_TABLE = """
 CREATE TABLE IF NOT EXISTS jobs (
     job_id        TEXT PRIMARY KEY,
     user_id       INTEGER,
+    chat_id       INTEGER,
     kind          TEXT NOT NULL,
     model         TEXT,
     width         INTEGER,
@@ -67,9 +78,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     out_bytes     INTEGER,
     exported_at   REAL
 );
+"""
+
+_INDEXES = """
 CREATE INDEX IF NOT EXISTS jobs_unexported ON jobs (exported_at)
     WHERE exported_at IS NULL;
 CREATE INDEX IF NOT EXISTS jobs_enqueued ON jobs (enqueued_at DESC);
+CREATE INDEX IF NOT EXISTS jobs_chat ON jobs (chat_id, enqueued_at DESC);
 """
 
 _lock = threading.Lock()
@@ -78,6 +93,20 @@ _conn = None
 
 def _log(what, exc):
     print(f"[stats] {what}: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _add_missing_columns(conn):
+    """Дотягивает старую таблицу до текущего COLUMNS.
+
+    ``CREATE TABLE IF NOT EXISTS`` существующую таблицу не трогает, поэтому у
+    базы, заведённой прежней версией, новых колонок не появится само. Пустая
+    колонка у старых строк — то, что нужно: данных за тот период всё равно нет.
+    """
+    have = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    for col in COLUMNS:
+        if col not in have:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
+            print(f"[stats] добавил колонку {col}", flush=True)
 
 
 def init():
@@ -89,7 +118,9 @@ def init():
         # и блокировать друг друга им незачем.
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.executescript(_SCHEMA)
+        conn.executescript(_TABLE)
+        _add_missing_columns(conn)
+        conn.executescript(_INDEXES)
         conn.commit()
         _conn = conn
         print(f"[stats] база {DB_PATH}, узел {NODE}", flush=True)

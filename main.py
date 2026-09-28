@@ -76,6 +76,11 @@ class Item(BaseModel):
     # Владелец задачи: по нему считается потолок и строится круг обслуживания.
     # Не задан — задача попадает к общему анонимному пользователю.
     user: int | None = None
+    # Чат, откуда пришла задача. Нужен только для статистики: единица жизни у
+    # бота — чат, а не человек, и по одним user_id не видно, в скольких группах
+    # он вообще живёт. На планировщик не влияет: круг обслуживания строится по
+    # людям, иначе один многолюдный чат забирал бы очередь целиком.
+    chat: int | None = None
     # Размер кадра. Относится ТОЛЬКО к видео: у картинок он берётся из
     # реестра ("size" в IMAGE_MODELS), потому что у каждой модели свои
     # удобные кратности. Бот его для картинок и не присылает — до
@@ -356,10 +361,31 @@ IMAGE_MODELS = {
 # не удалось — на простых промптах она уходит в иллюстрацию, а фотографичность
 # Z-Image недостижима. План: вернуть Z-Image и снять отказы через LoRA (см.
 # "lora" в реестре). Chroma остаётся доступной через IMAGE_MODEL=chroma_flash.
-# С 27.09.2026 по умолчанию qwen21 — см. комментарий у его записи в реестре.
-# Z-Image остаётся доступной через IMAGE_MODEL=z_image: она по-прежнему даёт
-# более красивый кадр там, где текста в картинке нет.
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "qwen21")
+# 27.09.2026 дефолтом ненадолго стала qwen21 — ради текста внутри картинки,
+# в котором Z-Image врёт почти всегда. 28.09.2026 вернулись обратно.
+#
+# ПОЧЕМУ ОТКАТИЛИСЬ: на КОРОТКИХ промптах Qwen сыплет кривыми картинками.
+# Замеряли-то её на длинных описаниях мемов — там она безупречна, — а живой
+# трафик выглядит иначе: «кота», «сиськи», «Ставрополь», «нарисуй зелёного
+# орка». По статистике за 28.09 таких большинство. Модель, судя по всему,
+# рассчитана на развёрнутое описание и на двух словах достраивает по своему
+# приору плохо. Отсюда же, кстати, берётся смысл PE-модели Qwen — отдельного
+# переписывателя коротких запросов в длинные (Qwen-Image-2.1-PE-T2I); без неё
+# короткий промпт этой модели противопоказан.
+#
+# Вторая причина, помельче: картинка подорожала с 12.4-13.0 с до 29.5 с.
+# Виноват не сам Qwen, а квантизация — bitsandbytes деквантует веса на каждом
+# слое. В ComfyUI ТА ЖЕ модель в int8_convrot считалась 14 с на том же
+# мегапикселе, то есть скорость возвращаема: нужен другой квантизатор
+# (torchao int8_weight_only или GGUF Q8 через from_single_file плюс пакет
+# gguf).
+#
+# Чтобы вернуться к qwen21 всерьёз, чинить надо ОБА пункта, и первый важнее.
+#
+# Запись qwen21 в реестре остаётся рабочей: IMAGE_MODEL=qwen21 включает её
+# обратно без пересборки. Замер обеих на реальных промптах бота — в памяти
+# проекта, файл qwen-image-21-evaluation.
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "z_image")
 
 # ==========================================================================
 # Правка изображений по инструкции (/api/edit)
@@ -1385,6 +1411,7 @@ def _record_job(job, card, started, finished):
     stats.record(
         job_id=id,
         user_id=job.get("user"),
+        chat_id=_stat_field(data, "chat"),
         kind=kind.value,
         model=model,
         width=width,
@@ -1626,6 +1653,7 @@ async def edit(
     steps: int | None = Form(None),
     seed: int | None = Form(None),
     user: int | None = Form(None),
+    chat: int | None = Form(None),      # см. комментарий у Item.chat
     # см. комментарий у Item.source_prompt
     source_prompt: str | None = Form(None),
     style: str | None = Form(None),
@@ -1655,14 +1683,15 @@ async def edit(
         "type": ProcessType.IMAGE_EDIT,
         "user": user,
         "data": {"prompt": prompt, "images": images, "steps": steps, "seed": seed,
-                 "source_prompt": source_prompt, "style": style},
+                 "source_prompt": source_prompt, "style": style, "chat": chat},
     })
 
     return {"id": id}
 
 
 @app.post("/api/transcription")
-async def transcription(file: UploadFile, user: int | None = Form(None)):
+async def transcription(file: UploadFile, user: int | None = Form(None),
+                        chat: int | None = Form(None)):
     if not os.path.exists("files"):
         os.mkdir("files")
 
@@ -1677,7 +1706,8 @@ async def transcription(file: UploadFile, user: int | None = Form(None)):
     set_result(id, Status.PENDING)
     try:
         enqueue_or_reject({"id": id, "type": ProcessType.TRANSCRIPTION,
-                           "data": {"filename": filename}, "user": user})
+                           "data": {"filename": filename, "chat": chat},
+                           "user": user})
     except HTTPException:
         # задача не встала — файл убираем за собой, чистить его больше некому
         if os.path.exists(filename):
@@ -1707,6 +1737,7 @@ async def i2v(
     fps: int | None = Form(None),
     model: Literal[tuple(VIDEO_MODELS)] = Form(DEFAULT_MODEL),
     user: int | None = Form(None),
+    chat: int | None = Form(None),      # см. комментарий у Item.chat
     # см. комментарий у Item.source_prompt
     source_prompt: str | None = Form(None),
     style: str | None = Form(None),
@@ -1721,7 +1752,7 @@ async def i2v(
         "user": user,
         "data": {"prompt": prompt, "image": image, "width": width,
                  "height": height, "fps": fps, "model": model,
-                 "source_prompt": source_prompt, "style": style},
+                 "source_prompt": source_prompt, "style": style, "chat": chat},
     })
 
     return {"id": id}
