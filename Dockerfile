@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip3 install -r requirements.txt
 
-COPY .env main.py scheduler.py gpu_runner.py comfy_client.py stats.py result_store.py ./
+COPY .env main.py scheduler.py gpu_runner.py comfy_client.py stats.py result_store.py cutout.py ./
 COPY comfy_workflows ./comfy_workflows
 
 ENV PYTHONUNBUFFERED=1

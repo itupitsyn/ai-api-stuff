@@ -12,6 +12,8 @@ import time
 import gc
 import traceback
 import json
+
+import cutout
 import requests
 
 from diffusers import (ZImagePipeline, ZImageTransformer2DModel, ChromaPipeline, PipelineQuantizationConfig,
@@ -81,6 +83,9 @@ class Item(BaseModel):
     # он вообще живёт. На планировщик не влияет: круг обслуживания строится по
     # людям, иначе один многолюдный чат забирал бы очередь целиком.
     chat: int | None = None
+    # Готовить ли результат как стикер: вырезать фон, обрезать по объекту и
+    # вписать в квадрат 512x512 с прозрачностью. Подробности в cutout.py.
+    sticker: bool = False
     # Размер кадра. Относится ТОЛЬКО к видео: у картинок он берётся из
     # реестра ("size" в IMAGE_MODELS), потому что у каждой модели свои
     # удобные кратности. Бот его для картинок и не присылает — до
@@ -1543,9 +1548,18 @@ def worker(results, lock, card):
                 else:
                     filtered_image = BytesIO()
                     res.save(filtered_image, "PNG")
-                    filtered_image.seek(0)
-                    set_result(id, Status.DONE,
-                               base64.b64encode(filtered_image.read()))
+                    png = filtered_image.getvalue()
+
+                    # Стикер готовим ЗДЕСЬ, а не в дочернем процессе: маска
+                    # считается на процессоре, и держать ради неё карту незачем.
+                    # Не вышло — отдаём обычную картинку: стикер украшение
+                    # поверх генерации, ронять из-за него посчитанное нельзя.
+                    if _stat_field(data, "sticker"):
+                        cut = cutout.to_sticker(png)
+                        if cut is not None:
+                            png = cut
+
+                    set_result(id, Status.DONE, base64.b64encode(png))
 
             else:  # T2V / I2V на diffusers (USE_COMFYUI=False, откат на nf4)
                 res = gpu.submit_and_wait(job)
@@ -1654,6 +1668,7 @@ async def edit(
     seed: int | None = Form(None),
     user: int | None = Form(None),
     chat: int | None = Form(None),      # см. комментарий у Item.chat
+    sticker: bool = Form(False),        # см. комментарий у Item.sticker
     # см. комментарий у Item.source_prompt
     source_prompt: str | None = Form(None),
     style: str | None = Form(None),
@@ -1683,7 +1698,8 @@ async def edit(
         "type": ProcessType.IMAGE_EDIT,
         "user": user,
         "data": {"prompt": prompt, "images": images, "steps": steps, "seed": seed,
-                 "source_prompt": source_prompt, "style": style, "chat": chat},
+                 "source_prompt": source_prompt, "style": style, "chat": chat,
+                 "sticker": sticker},
     })
 
     return {"id": id}
