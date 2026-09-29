@@ -952,6 +952,13 @@ def _run_image_edit(data):
     return out
 
 
+# Признак «в файле нет звука» в выводе ffmpeg и ответ, который увидит человек.
+# Бот такие файлы отсекает у себя (гифка описывается по превью), но сюда ходит
+# не только он, да и немое видео он не распознает заранее.
+NO_AUDIO_MARK = "does not contain any stream"
+NO_AUDIO_MESSAGE = "в файле нет звуковой дорожки — расшифровывать нечего"
+
+
 def _run_transcription(data):
     # Транзиентно: whisperx грузит свои модели и освобождает после, видео-слот не трогаем.
     # Импорты ленивые — см. комментарий у секции импортов (тяжёлый аудио-стек,
@@ -975,7 +982,21 @@ def _run_transcription(data):
         # 1. Transcribe with original whisper (batched)
         model = whisperx.load_model("large-v3", device, compute_type="float16", vad_method="silero")
 
-        audio = whisperx.load_audio(audio_file)
+        try:
+            audio = whisperx.load_audio(audio_file)
+        except Exception as e:
+            # Файл без звуковой дорожки: гифка, немое видео, битая запись.
+            # whisperx поднимает сюда весь вывод ffmpeg — десяток строк про
+            # версию и кодеки, в которых тонет единственная значимая фраза.
+            # Клиенту от неё пользы нет, а в логе она мусор, поэтому наружу
+            # отдаём короткую причину, а полный текст оставляем в логе.
+            text = str(e)
+            print(f"[trans] не открыл {audio_file}: {text[-400:]}", flush=True)
+            if NO_AUDIO_MARK in text:
+                raise RuntimeError(NO_AUDIO_MESSAGE) from None
+
+            raise RuntimeError("не удалось прочитать файл") from None
+
         result = model.transcribe(audio, batch_size=16)
 
         language_code = result["language"]
