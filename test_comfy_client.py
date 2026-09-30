@@ -90,6 +90,27 @@ def test_find_output_file_gifs_fallback():
     assert find_output_file(entry) == ("a.webp", "", "output")
 
 
+def test_find_output_file_skips_inputs():
+    """Входные файлы в истории не должны выигрывать у результата.
+
+    LoadVideo отчитывается в outputs загруженным файлом с типом "input" ради
+    превью, и в графе замены человека их четыре. Пока брался первый попавшийся
+    узел, наружу уезжала маска вместо посчитанного видео.
+    """
+    entry = {"outputs": {
+        "mv": {"gifs": [{"filename": "swap_mask.mp4", "type": "input"}]},
+        "bgv": {"gifs": [{"filename": "swap_bg.mp4", "type": "input"}]},
+        "save": {"videos": [{"filename": "swap_00001_.mp4", "type": "output"}]},
+    }}
+    assert find_output_file(entry) == ("swap_00001_.mp4", "", "output")
+
+
+def test_find_output_file_input_only_still_found():
+    """Если настоящего выхода нет вовсе — отдаём что есть, а не None."""
+    entry = {"outputs": {"mv": {"gifs": [{"filename": "x.mp4", "type": "input"}]}}}
+    assert find_output_file(entry) == ("x.mp4", "", "input")
+
+
 def test_find_output_file_none():
     assert find_output_file({"outputs": {"3": {"text": ["nope"]}}}) is None
     assert find_output_file({}) is None

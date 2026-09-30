@@ -278,14 +278,25 @@ def build_video_workflow(model, kind, template, *, prompt, image_name=None,
 
 
 def find_output_file(history_entry):
-    """Находит (filename, subfolder, type) выходного файла в outputs history-записи."""
-    for node_out in history_entry.get("outputs", {}).values():
-        for key in ("videos", "gifs", "images"):
-            files = node_out.get(key)
-            if files:
-                f = files[0]
-                return f["filename"], f.get("subfolder", ""), f.get("type", "output")
-    return None
+    """Находит (filename, subfolder, type) выходного файла в outputs history-записи.
+
+    Сначала ищем файлы с типом "output" и только потом всё остальное. Это не
+    придирка: в истории отчитываются и ВХОДНЫЕ узлы — LoadVideo кладёт туда
+    загруженный файл с типом "input" ради превью. Пока в графе был один
+    SaveVideo, порядок не имел значения, но в замене человека четыре LoadVideo,
+    и наружу уезжала маска вместо результата — при том что ComfyUI посчитал всё
+    правильно и файл лежал на диске.
+    """
+    def pick(want_output):
+        for node_out in history_entry.get("outputs", {}).values():
+            for key in ("videos", "gifs", "images"):
+                for f in node_out.get(key) or ():
+                    ftype = f.get("type", "output")
+                    if (ftype == "output") == want_output:
+                        return f["filename"], f.get("subfolder", ""), ftype
+        return None
+
+    return pick(True) or pick(False)
 
 
 class ComfyClient:
@@ -294,15 +305,24 @@ class ComfyClient:
         self.client_id = client_id or uuid.uuid4().hex
         self.poll_interval = poll_interval
 
-    def upload_image(self, image_bytes, filename="input.png"):
+    def upload_file(self, data, filename, content_type, timeout=300):
+        """Кладёт файл во входной каталог ComfyUI и возвращает имя для нод.
+
+        Эндпойнт называется /upload/image, но принимает и видео: LoadVideo
+        берёт файлы из того же каталога. Имя поля формы обязано остаться
+        "image" — это не про тип содержимого, а про протокол.
+        """
         r = requests.post(
             f"{self.base}/upload/image",
-            files={"image": (filename, io.BytesIO(image_bytes), "image/png")},
-            data={"overwrite": "true"}, timeout=60)
+            files={"image": (filename, io.BytesIO(data), content_type)},
+            data={"overwrite": "true"}, timeout=timeout)
         r.raise_for_status()
         info = r.json()
         name = info["name"]
         return f"{info['subfolder']}/{name}" if info.get("subfolder") else name
+
+    def upload_image(self, image_bytes, filename="input.png"):
+        return self.upload_file(image_bytes, filename, "image/png", timeout=60)
 
     def submit(self, workflow):
         r = requests.post(f"{self.base}/prompt",

@@ -22,10 +22,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # requirements.txt прибито всё, включая коммит diffusers, — пересборка
 # воспроизводима, и дробить слои больше незачем.
 COPY requirements.txt .
-RUN pip3 install -r requirements.txt
+# Второй командой в ТОМ ЖЕ слое, а не отдельным: onnxruntime и onnxruntime-gpu
+# кладутся в один каталог пакета и затирают друг друга, а порядок установки
+# внутри одного pip-вызова не задаётся. Процессорный приезжает зависимостью
+# whisperx и в сборке лёг поверх GPU-варианта — детекция позы уехала на
+# процессор и стала медленнее в одиннадцать раз (88 с против 8). Поэтому
+# GPU-сборку ставим принудительно последней; --no-deps, чтобы она не тянула
+# за собой разрешение зависимостей заново.
+RUN pip3 install -r requirements.txt \
+ && pip3 install --no-deps --force-reinstall onnxruntime-gpu==1.23.2
 
-COPY .env main.py scheduler.py gpu_runner.py comfy_client.py stats.py result_store.py cutout.py ./
+COPY .env main.py scheduler.py gpu_runner.py comfy_client.py stats.py result_store.py cutout.py swap_prep.py swap_workflow.py ./
 COPY comfy_workflows ./comfy_workflows
+# Препроцессор Wan как есть, из их репозитория. Веса к нему монтируются с
+# хоста и в образ не идут — там 2.5 ГБ.
+COPY wan_preprocess ./wan_preprocess
 
 ENV PYTHONUNBUFFERED=1
 

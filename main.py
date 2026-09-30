@@ -64,6 +64,8 @@ class ProcessType(Enum):
     TRANSCRIPTION = "trans"
     T2V = 't2v'
     I2V = 'i2v'
+    # Замена человека в видео сгенерированным персонажем (Wan 2.2 Animate).
+    SWAP = 'swap'
 
 
 class Status(Enum):
@@ -133,6 +135,11 @@ NEG_PROMPT = (
 # Видео-задачи разделяют один резидентный «видео-слот» (t2v/i2v по ~50 ГБ,
 # вместе не влезают). Картинки/аудио грузятся транзиентно и слот не трогают.
 VIDEO_TYPES = (ProcessType.T2V, ProcessType.I2V)
+# Всё, что считает ComfyUI и надолго занимает карту. Замена сюда входит, а вот
+# в VIDEO_TYPES — НЕТ, и это не описка: тем кортежем помечены умения удалённой
+# карты, а весов Wan Animate на чужом узле нет. Разведи их — и замена поедет
+# туда, где ей нечем считать.
+COMFY_TYPES = VIDEO_TYPES + (ProcessType.SWAP,)
 
 # Видео гоним через ComfyUI (fp8_scaled, качество лучше nf4, offload/VRAM разруливает
 # сам ComfyUI через /free). False → видео на diffusers (путь USE_FP8 ниже, откат на nf4).
@@ -1267,7 +1274,7 @@ for _c in cards:
         NODE_VIDEO_CAPS[_c.node] = _node_video_cap(_remote_ram_gb(_c.comfy.base), 1)
 
 scheduler = Scheduler(
-    VIDEO_TYPES,
+    COMFY_TYPES,
     devices=tuple(c.key for c in cards),
     max_video_batch=MAX_VIDEO_BATCH,
     max_wait_secs=MAX_WAIT_SECS,
@@ -1307,6 +1314,93 @@ def _run_video_comfy(card, ptype, data):
         prompt=get("prompt"), image_name=image_name,
         width=get("width"), height=get("height"), fps=get("fps"))
     return card.comfy.run(wf)
+
+
+SWAP_MAX_SECONDS = float(os.getenv("SWAP_MAX_SECONDS", "10"))
+
+
+def _swap_size(width, height, area=386000, step=16):
+    """Размер генерации по бюджету ПЛОЩАДИ, пропорции исходника.
+
+    Именно площади, а не длинной стороны: по стороне квадратный ролик дал бы
+    832x832 — вдвое больше работы, чем вертикальный при тех же настройках, и
+    окно внимания перестало бы влезать в память. Выше разрешения исходника не
+    поднимаемся: фон берётся из него и только растянулся бы.
+    """
+    k = min(1.0, (area / max(1, width * height)) ** 0.5)
+    snap = lambda v: max(step, int(round(v * k / step)) * step)   # noqa: E731
+    return snap(width), snap(height)
+
+
+def _run_swap(card, data):
+    """Замена человека в видео: подготовка на карте → граф Wan в ComfyUI.
+
+    Порядок именно такой и по-другому не работает:
+
+    1. Просим ComfyUI отпустить карту. Он держит прошлую модель в кэше, а
+       подготовке нужно 4.3 ГБ, и надеяться на остаток нельзя.
+    2. Подготовка живёт в ОДНОРАЗОВОМ дочернем процессе и умирает вместе с
+       задачей. Освободить VRAM изнутри живого процесса нельзя: CUDA держит
+       контекст, empty_cache его не отдаёт. Замерено — после выхода на карте
+       ровно столько же, сколько было до запуска.
+    3. Только теперь ComfyUI грузит Wan на 22 ГБ. С подготовкой вместе они в
+       24 не помещаются, но и не нужно: она живёт полминуты, он — минуты.
+    """
+    import cv2
+    import swap_prep
+    import swap_workflow
+
+    seconds = min(float(data.get("seconds") or 5.0), SWAP_MAX_SECONDS)
+    with tempfile.TemporaryDirectory() as work:
+        src = os.path.join(work, "src.mp4")
+        with open(src, "wb") as f:
+            f.write(data["video"])
+
+        cap = cv2.VideoCapture(src)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        if not (w and h and total):
+            raise RuntimeError("не удалось прочитать видео")
+
+        length = min(int(round(seconds * fps)), total)
+        length = max(5, length - (length - 1) % 4)      # сетка 4n+1
+        gw, gh = _swap_size(w, h)
+        print(f"[swap] {w}x{h} @ {fps:.3f} -> {gw}x{gh}, {length} кадров",
+              flush=True)
+
+        card.comfy.free(wait_vram_mb=FREE_VRAM_TARGET_MB)
+        prep = GpuRunner(swap_prep.worker, device=card.index)
+        try:
+            out = prep.submit_and_wait({
+                "id": "prep", "video_path": src, "out_dir": work,
+                "width": gw, "height": gh, "length": length, "fps": fps})
+        finally:
+            prep.shutdown()
+        if not isinstance(out, dict) or out.get("error"):
+            raise RuntimeError((out or {}).get("error", "подготовка не удалась"))
+
+        names = {}
+        for kind, path in out["files"].items():
+            with open(path, "rb") as f:
+                names[kind] = card.comfy.upload_file(
+                    f.read(), f"swap_{kind}.mp4", "video/mp4")
+        ref = card.comfy.upload_image(data["image"], "swap_ref.png")
+
+        text = (f"Character Description: {data['prompt']}\n"
+                f"Background description: "
+                f"{data.get('background') or 'the original scene, unchanged'}")
+        wf = swap_workflow.build(
+            ref_image=ref, pose_video=names["pose"], bg_video=names["bg"],
+            mask_video=names["mask"], face_video=names["face"],
+            character_text=text, width=gw, height=gh, length=length, fps=fps,
+            seed=data.get("seed") or 7)
+        bad = swap_workflow.check_links(wf)
+        if bad:
+            raise RuntimeError("граф собран неверно: " + "; ".join(bad))
+        return card.comfy.run(wf)
 
 
 def _mem_snapshot():
@@ -1429,6 +1523,10 @@ def _record_job(job, card, started, finished):
         model, width, height = EDIT_MODEL, None, None
     elif kind == ProcessType.TRANSCRIPTION:
         model, width, height = None, None, None
+    elif kind == ProcessType.SWAP:
+        # Размер считается из исходного ролика по бюджету площади, в запросе
+        # его нет; модель здесь одна и выбора не предполагает.
+        model, width, height = "wan2.2_animate", None, None
 
     with lock:
         outcome = results.get(id) or {}
@@ -1481,7 +1579,7 @@ def worker(results, lock, card):
         type = job.get("type")
         data = job.get("data")
 
-        job_backend = "comfy" if (type in VIDEO_TYPES and USE_COMFYUI) else "diffusers"
+        job_backend = "comfy" if (type in COMFY_TYPES and USE_COMFYUI) else "diffusers"
 
         # diffusers-откат собран только вокруг Wan; H3 живёт исключительно в ComfyUI.
         # Молча подменить модель нельзя — вернём ошибку, не трогая GPU.
@@ -1531,10 +1629,11 @@ def worker(results, lock, card):
                     "id": id, "type": type, "backend": job_backend,
                     "user": job.get("user"), "started": time.time()}
 
-            # --- видео через ComfyUI (host-сторона, без diffusers-процесса) ---
+            # --- видео и замена через ComfyUI (без долгоживущего diffusers) ---
             if job_backend == "comfy":
                 try:
-                    res = _run_video_comfy(card, type, data)
+                    res = (_run_swap(card, data) if type == ProcessType.SWAP
+                           else _run_video_comfy(card, type, data))
                     set_result(id, Status.DONE, base64.b64encode(res))
                 except Exception as e:
                     set_result(id, Status.ERROR, str(e))
@@ -1790,6 +1889,46 @@ async def i2v(
         "data": {"prompt": prompt, "image": image, "width": width,
                  "height": height, "fps": fps, "model": model,
                  "source_prompt": source_prompt, "style": style, "chat": chat},
+    })
+
+    return {"id": id}
+
+
+@app.post("/api/swap")
+async def swap(
+    video: UploadFile,
+    character: UploadFile,
+    prompt: str = Form(...),
+    background: str | None = Form(None),
+    seconds: float = Form(5.0),
+    seed: int | None = Form(None),
+    user: int | None = Form(None),
+    chat: int | None = Form(None),      # см. комментарий у Item.chat
+):
+    """Замена человека в видео сгенерированным персонажем.
+
+    video — ролик с человеком, character — картинка персонажа, prompt — его
+    описание ПО-АНГЛИЙСКИ (кто это, а не что происходит в кадре).
+
+    Движение, мимика и артикуляция остаются оригинальными: модель берёт их из
+    видео, а не сочиняет. Поэтому если в исходнике человек не открывает рот, не
+    откроет его и персонаж — это не сбой, а устройство.
+
+    Референс лучше давать в том же кадрировании, что и ролик: чего в нём не
+    видно, модель досочиняет, и в разных окнах внимания по-разному. На
+    поясном портрете к ролику в полный рост уезжает одежда ниже пояса.
+    """
+    id = str(uuid.uuid4())
+    print("swap", id)
+    set_result(id, Status.PENDING)
+    enqueue_or_reject({
+        "id": id,
+        "type": ProcessType.SWAP,
+        "user": user,
+        "data": {"video": await video.read(),
+                 "image": await character.read(),
+                 "prompt": prompt, "background": background,
+                 "seconds": seconds, "seed": seed, "chat": chat},
     })
 
     return {"id": id}
