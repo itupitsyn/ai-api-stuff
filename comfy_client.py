@@ -27,6 +27,8 @@ import uuid
 
 import requests
 
+# Сколько ждём ComfyUI. См. комментарий у wait().
+WAIT_TIMEOUT = int(os.getenv("COMFY_WAIT_TIMEOUT", "5400"))
 DEFAULT_BASE = os.getenv("COMFYUI_URL", "http://comfyui:8188")
 WORKFLOW_DIR = os.getenv("COMFY_WORKFLOW_DIR",
                          os.path.join(os.path.dirname(__file__), "comfy_workflows"))
@@ -330,7 +332,15 @@ class ComfyClient:
         r.raise_for_status()
         return r.json()["prompt_id"]
 
-    def wait(self, prompt_id, timeout=1800):
+    def wait(self, prompt_id, timeout=WAIT_TIMEOUT):
+        """Ждёт готовности задачи в ComfyUI.
+
+        Потолок задавался под видео (там 3-7 минут), а замена человека без
+        дистилляционной lora считалась 43 минуты — клиент сдавался на 30-й,
+        хотя ComfyUI досчитал и файл лежал на диске. Терять готовую работу
+        из-за собственного таймера — худший из отказов, поэтому потолок поднят
+        и вынесен в переменную.
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             r = requests.get(f"{self.base}/history/{prompt_id}", timeout=30)
@@ -406,10 +416,10 @@ class ComfyClient:
               f"(ждали {wait_vram_mb}); продолжаем", flush=True)
         return got
 
-    def run(self, workflow):
+    def run(self, workflow, timeout=WAIT_TIMEOUT):
         """Полный цикл: submit → wait → скачать байты видео."""
         pid = self.submit(workflow)
-        entry = self.wait(pid)
+        entry = self.wait(pid, timeout=timeout)
         found = find_output_file(entry)
         if not found:
             raise RuntimeError(f"ComfyUI prompt {pid}: no output file in history")

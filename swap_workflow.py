@@ -53,8 +53,8 @@ def context_for(width, height):
 
 def build(*, ref_image, pose_video, bg_video, mask_video, face_video,
           character_text, width, height, length, fps, seed=7,
-          steps=STEPS, context_length=None,
-          context_overlap=CONTEXT_OVERLAP, prefix="swap"):
+          steps=None, context_length=None,
+          context_overlap=CONTEXT_OVERLAP, prefix="swap", speed_lora=True):
     """Готовый граф. length обязан лежать на сетке 4n+1.
 
     context_length подобран замерами на 576x1024: 49 кадров дают 506 с и
@@ -72,9 +72,18 @@ def build(*, ref_image, pose_video, bg_video, mask_video, face_video,
     n("unet", "UNETLoader", unet_name=UNET, weight_dtype="default")
     n("relight", "LoraLoaderModelOnly", model=["unet", 0],
       lora_name=LORA_RELIGHT, strength_model=1.0)
-    n("fast", "LoraLoaderModelOnly", model=["relight", 0],
-      lora_name=LORA_SPEED, strength_model=1.0)
-    n("shift", "ModelSamplingSD3", model=["fast", 0], shift=5.0)
+    # lightx2v обучена на Wan 2.2, а её с Animate карточка модели использовать
+    # НЕ рекомендует: "weight changes during training may lead to unexpected
+    # behavior". Подозрение на неё есть — персонаж открывает рот там, где в
+    # исходнике он закрыт, — поэтому она выключается, но по умолчанию остаётся:
+    # без неё нужно двадцать шагов с guidance, а это вшестеро дороже.
+    if speed_lora:
+        n("fast", "LoraLoaderModelOnly", model=["relight", 0],
+          lora_name=LORA_SPEED, strength_model=1.0)
+        base = ["fast", 0]
+    else:
+        base = ["relight", 0]
+    n("shift", "ModelSamplingSD3", model=base, shift=5.0)
     # retain_first_frame=True — ЯКОРЬ на референс. Без него референс попадает
     # только в первое окно, и со второго персонаж переодевается: в замере к
     # 81-му кадру костюм менялся целиком вместе с причёской.
@@ -110,12 +119,21 @@ def build(*, ref_image, pose_video, bg_video, mask_video, face_video,
       face_video=["fvc", 0], pose_video=["pvc", 0],
       background_video=["bgvc", 0], character_mask=["mask", 0])
 
-    n("sampler", "KSamplerSelect", sampler_name="lcm")
+    # Параметры честного пути взяты из официального конфига Wan
+    # (wan/configs/wan_animate_14B.py): sample_steps=20, sample_guide_scale=1.0,
+    # sample_shift=5.0, солвер unipc. Guidance у них ЕДИНИЦА, а не пятёрка —
+    # я сперва поставил 5 наугад и получил плоскую мыльную картинку, решив, что
+    # виновата модель. Единица заодно втрое дешевле: без CFG нет второго прохода
+    # на шаг.
+    if steps is None:
+        steps = STEPS if speed_lora else 20
+    cfg = 1.0
+    n("sampler", "KSamplerSelect",
+      sampler_name="lcm" if speed_lora else "uni_pc")
     n("sigmas", "BasicScheduler", model=["ctx", 0], scheduler="simple",
       steps=steps, denoise=1.0)
-    # cfg=1: дистилляционная lightx2v делает своё за 6 шагов, guidance не нужен.
     n("sample", "SamplerCustom", model=["ctx", 0], add_noise=True,
-      noise_seed=seed, cfg=1.0, positive=["w2v", 0], negative=["w2v", 1],
+      noise_seed=seed, cfg=cfg, positive=["w2v", 0], negative=["w2v", 1],
       sampler=["sampler", 0], sigmas=["sigmas", 0], latent_image=["w2v", 2])
 
     n("trim", "TrimVideoLatent", samples=["sample", 0], trim_amount=["w2v", 3])

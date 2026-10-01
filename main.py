@@ -1316,7 +1316,17 @@ def _run_video_comfy(card, ptype, data):
     return card.comfy.run(wf)
 
 
-SWAP_MAX_SECONDS = float(os.getenv("SWAP_MAX_SECONDS", "10"))
+# Потолок длины ролика. 15 секунд — проверенный предел, а не круглое число:
+# на 449 кадрах 464x832 пик памяти дошёл до 24.1 ГБ из 24.6, то есть 98% карты.
+# Окно внимания длину не удорожает (оно постоянного размера), но условия и
+# кроп лица хранятся на ВСЮ длину сразу и растут линейно. Поднимать выше без
+# замера нельзя: запаса не осталось.
+SWAP_MAX_SECONDS = float(os.getenv("SWAP_MAX_SECONDS", "15"))
+# Дистилляционная lora: с ней 6 шагов, без неё 20 с guidance (вшестеро
+# дороже). Выключается, чтобы сравнить — карточка Wan её с Animate не
+# рекомендует, и есть подозрение, что из-за неё персонаж открывает рот
+# там, где в исходнике он закрыт.
+SWAP_SPEED_LORA = os.getenv("SWAP_SPEED_LORA", "1") not in ("0", "false", "")
 
 
 def _swap_size(width, height, area=386000, step=16):
@@ -1361,9 +1371,13 @@ def _run_swap(card, data):
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # Метаданных мало: на файле, который вовсе не видео, cv2 отдаёт
+        # ненулевые размеры, и дальше вылезало невнятное «в ролике 0 кадров».
+        # Единственная надёжная проверка — прочитать кадр.
+        readable = cap.read()[0]
         cap.release()
-        if not (w and h and total):
-            raise RuntimeError("не удалось прочитать видео")
+        if not (w and h and total and readable):
+            raise RuntimeError("не удалось прочитать видео — это точно видеофайл?")
 
         length = min(int(round(seconds * fps)), total)
         length = max(5, length - (length - 1) % 4)      # сетка 4n+1
@@ -1396,11 +1410,44 @@ def _run_swap(card, data):
             ref_image=ref, pose_video=names["pose"], bg_video=names["bg"],
             mask_video=names["mask"], face_video=names["face"],
             character_text=text, width=gw, height=gh, length=length, fps=fps,
-            seed=data.get("seed") or 7)
+            seed=data.get("seed") or 7, speed_lora=SWAP_SPEED_LORA)
         bad = swap_workflow.check_links(wf)
         if bad:
             raise RuntimeError("граф собран неверно: " + "; ".join(bad))
-        return card.comfy.run(wf)
+        return _swap_add_audio(card.comfy.run(wf), src, length / fps, work)
+
+
+def _swap_add_audio(video, source, seconds, work):
+    """Возвращает дорожку исходника в результат.
+
+    Wan звука не делает вовсе, а речь в кадре осталась оригинальной — без
+    дорожки получается немой ролик с говорящим человеком. Дрейфа тут нет:
+    кадры берутся с начала и в родном fps, так что звук режется просто по
+    длине результата.
+
+    Если что-то пошло не так (в исходнике нет звука, ffmpeg споткнулся) —
+    отдаём видео как есть: молчащий результат лучше, чем никакого.
+    """
+    import subprocess
+
+    import imageio_ffmpeg
+
+    raw = os.path.join(work, "out_raw.mp4")
+    mixed = os.path.join(work, "out.mp4")
+    with open(raw, "wb") as f:
+        f.write(video)
+    try:
+        subprocess.run(
+            [imageio_ffmpeg.get_ffmpeg_exe(), "-v", "error", "-y",
+             "-i", raw, "-i", source, "-map", "0:v", "-map", "1:a:0",
+             "-t", f"{seconds:.4f}", "-c:v", "copy", "-c:a", "aac",
+             "-b:a", "128k", mixed],
+            check=True, capture_output=True, timeout=120)
+        with open(mixed, "rb") as f:
+            return f.read()
+    except Exception as exc:                              # noqa: BLE001
+        print(f"[swap] звук не подмешался ({exc}), отдаю без него", flush=True)
+        return video
 
 
 def _mem_snapshot():
@@ -1675,7 +1722,12 @@ def worker(results, lock, card):
                     # Не вышло — отдаём обычную картинку: стикер украшение
                     # поверх генерации, ронять из-за него посчитанное нельзя.
                     if _stat_field(data, "sticker"):
-                        cut = cutout.to_sticker(png)
+                        # Исходник отдаём, чтобы стикер не уехал по тону:
+                        # правка возвращает картинку чуть темнее входа, сдвиг
+                        # копится и у разных эмоций разный. У txt2img исходника
+                        # нет, и тон тогда не трогается. См. cutout._match_tone.
+                        src = _stat_field(data, "images")
+                        cut = cutout.to_sticker(png, source=src[0] if src else None)
                         if cut is not None:
                             png = cut
 
@@ -1746,6 +1798,26 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Страничка замены живёт отдельным файлом и может быть открыта откуда угодно —
+# значит, браузер ходит сюда с ЧУЖОГО origin. Без этого он молча режет запрос,
+# и снаружи это выглядит как «кнопка не работает».
+#
+# Список источников задаётся переменной: "*" открывает API всему, что доберётся
+# по сети, и годится только для домашней сети за роутером. Наружу — перечислять
+# адреса явно.
+_cors = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors:
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    )
+    print(f"[cors] разрешены источники: {', '.join(_cors)}", flush=True)
 
 
 @app.get("/api")
