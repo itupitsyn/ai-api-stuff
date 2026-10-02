@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Стикеры — стенд</title>
+<style>
+:root {
+  --bg: #16171a; --panel: #1d1f23; --line: #2d3036; --ink: #e8e9ec;
+  --dim: #9aa0aa; --accent: #4ea1ff; --ok: #4ec98a; --bad: #ef6b6b; --radius: 10px;
+}
+:root[data-theme="light"] {
+  --bg: #f4f5f7; --panel: #ffffff; --line: #e1e4e9; --ink: #1b1d21;
+  --dim: #6b727d; --accent: #1f6feb;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header {
+  padding: 16px; border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+}
+h1 { font-size: 17px; margin: 0; font-weight: 650; }
+.sub { color: var(--dim); font-size: 12px; }
+.grow { flex: 1; }
+.wrap { display: flex; gap: 16px; padding: 16px; align-items: flex-start; }
+.side {
+  width: 330px; flex: none; background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 14px; position: sticky; top: 16px;
+}
+.main { flex: 1; min-width: 0; }
+label.row { display: block; margin: 12px 0 5px; color: var(--dim); font-size: 12px; }
+input[type=number], textarea, select {
+  width: 100%; background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 7px; padding: 7px 9px; font: inherit; font-size: 13px;
+}
+textarea { resize: vertical; min-height: 54px; font-size: 12px; line-height: 1.4; }
+button {
+  background: var(--accent); color: #fff; border: 0; border-radius: 7px;
+  padding: 9px 14px; font: inherit; font-weight: 600; cursor: pointer;
+}
+button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); font-weight: 500; }
+button:disabled { opacity: .5; cursor: default; }
+button.mini { padding: 4px 9px; font-size: 12px; font-weight: 500; }
+.drop {
+  border: 1.5px dashed var(--line); border-radius: var(--radius); padding: 16px;
+  text-align: center; color: var(--dim); cursor: pointer; font-size: 13px;
+}
+.drop.on { border-color: var(--accent); color: var(--ink); }
+.drop img { max-width: 100%; max-height: 190px; border-radius: 7px; display: block; margin: 0 auto; }
+.seg { display: flex; gap: 6px; }
+.seg button { flex: 1; }
+.seg button[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: transparent; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  overflow: hidden; display: flex; flex-direction: column;
+}
+.card.off { opacity: .45; }
+.chead { display: flex; align-items: center; gap: 8px; padding: 9px 11px; border-bottom: 1px solid var(--line); }
+.chead .key { font-weight: 600; }
+.chead .emo { font-size: 16px; }
+.shot { aspect-ratio: 1; position: relative; background-size: 18px 18px; }
+.shot img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.bg-dark { background: #141418; }
+.bg-light { background: #ffffff; }
+.bg-check {
+  background-color: #cfd3d8;
+  background-image:
+    linear-gradient(45deg, #9aa0a8 25%, transparent 25%, transparent 75%, #9aa0a8 75%),
+    linear-gradient(45deg, #9aa0a8 25%, transparent 25%, transparent 75%, #9aa0a8 75%);
+  background-position: 0 0, 9px 9px;
+}
+.meta { padding: 8px 11px; font-size: 11.5px; color: var(--dim); display: flex; flex-wrap: wrap; gap: 4px 10px; }
+.meta b { color: var(--ink); font-weight: 600; }
+.meta .bad b { color: var(--bad); }
+.meta .ok b { color: var(--ok); }
+.acts { padding: 0 11px 10px; display: flex; gap: 6px; }
+details { margin-top: 8px; }
+summary { cursor: pointer; color: var(--dim); font-size: 12px; }
+.prompt { padding: 0 11px 10px; }
+.status { color: var(--dim); font-size: 12.5px; margin-top: 10px; min-height: 18px; }
+.spin { color: var(--dim); font-size: 12px; }
+.err { color: var(--bad); font-size: 12px; padding: 0 11px 10px; }
+@media (max-width: 820px) {
+  .wrap { flex-direction: column; padding: 16px; }
+  .side { width: 100%; position: static; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Стикеры — стенд</h1>
+  <span class="sub">формулировки те же, что в боте</span>
+  <span class="grow"></span>
+  <div class="seg" style="width:270px">
+    <button class="ghost" data-bg="bg-dark" aria-pressed="true">тёмный</button>
+    <button class="ghost" data-bg="bg-light" aria-pressed="false">светлый</button>
+    <button class="ghost" data-bg="bg-check" aria-pressed="false">шашечки</button>
+  </div>
+</header>
+
+<div class="wrap">
+  <aside class="side">
+    <div class="drop" id="drop">
+      <div id="dropText">перетащи фото сюда<br>или нажми</div>
+      <input type="file" id="file" accept="image/*" hidden>
+    </div>
+
+    <label class="row">кадр</label>
+    <div class="seg">
+      <button class="ghost" id="modeBody" aria-pressed="true">с телом</button>
+      <button class="ghost" id="modeHead" aria-pressed="false">только голова</button>
+    </div>
+
+    <label class="row">цвет экрана</label>
+    <div class="seg">
+      <button class="ghost" id="scrGreen" aria-pressed="true">зелёный</button>
+      <button class="ghost" id="scrBlue" aria-pressed="false">синий</button>
+    </div>
+    <div class="sub" style="margin-top:6px">бот выбирает его сам, по фотографии: тот, которого на человеке нет</div>
+
+    <label class="row">чем резать фон</label>
+    <div class="seg">
+      <button class="ghost" id="cutAuto" aria-pressed="true">хромакей</button>
+      <button class="ghost" id="cutNet" aria-pressed="false">сетка</button>
+    </div>
+    <div class="sub" id="cutHint" style="margin-top:6px"></div>
+
+    <label class="row">зерно (пусто — случайное)</label>
+    <input type="number" id="seed" placeholder="например 111">
+
+    <label class="row">одновременно задач</label>
+    <select id="par"><option>1</option><option selected>2</option><option>3</option></select>
+
+    <label class="row" style="margin-top:10px">
+      <input type="checkbox" id="raw"> ещё и сырой кадр, без вырезания
+    </label>
+
+    <details>
+      <summary>общие части промта</summary>
+      <label class="row">зелёный экран</label>
+      <textarea id="clGreen"></textarea>
+      <label class="row">сохранить человека</label>
+      <textarea id="clKeep"></textarea>
+    </details>
+
+    <div style="display:flex; gap:6px; margin-top:14px">
+      <button id="go" style="flex:1">Сгенерировать</button>
+      <button class="ghost" id="stop" disabled>Стоп</button>
+    </div>
+    <div style="display:flex; gap:6px; margin-top:6px">
+      <button class="ghost mini" id="all" style="flex:1">выбрать все</button>
+      <button class="ghost mini" id="none" style="flex:1">снять все</button>
+    </div>
+    <div class="status" id="status"></div>
+  </aside>
+
+  <main class="main">
+    <div class="grid" id="grid"></div>
+  </main>
+</div>
+
+<script>
+const DATA = {
+  "emotions": [
+    {"Key": "laugh", "Emoji": "\u{1F602}",
+     "Instruction": "make this person laugh out loud, head tilted back, eyes squeezed shut",
+     "Pose": "shoulders thrown back"},
+    {"Key": "approve", "Emoji": "\u{1F44D}",
+     "Instruction": "make this person smile confidently and give a thumbs up to the camera with one hand",
+     "Pose": "upper body turned a little to one side, the raised arm bent at the elbow, the other arm resting down at their side"},
+    {"Key": "deadpan", "Emoji": "\u{1F610}",
+     "Instruction": "make this person stare at the camera with a completely blank deadpan face",
+     "Pose": "shoulders square to the camera, perfectly still"},
+    {"Key": "angry", "Emoji": "\u{1F621}",
+     "Instruction": "make this person furious, brows drawn together, jaw clenched, glaring",
+     "Pose": "shoulders squared and leaning in towards the camera"},
+    {"Key": "sad", "Emoji": "\u{1F622}",
+     "Instruction": "make this person look miserable, mouth turned down, watery eyes",
+     "Pose": "shoulders slumped and turned away a little"},
+    {"Key": "squint", "Emoji": "\u{1F928}",
+     "Instruction": "make this person squint at the camera with one raised eyebrow, sceptical",
+     "Pose": "upper body turned to one side, leaning back away from the camera"},
+    {"Key": "facepalm", "Emoji": "\u{1F926}",
+     "Instruction": "make this person cover their face with one palm in despair",
+     "Pose": "head bowed into the palm, shoulders drawn up and turned away a little"},
+    {"Key": "sleep", "Emoji": "\u{1F634}",
+     "Instruction": "make this person sleep peacefully, eyes closed, relaxed face, mouth slightly open",
+     "Pose": "head tilted to one side, shoulders dropped"},
+    {"Key": "think", "Emoji": "\u{1F914}",
+     "Instruction": "make this person think hard, hand on chin, looking up and aside",
+     "Pose": "upper body turned a little away from the camera"},
+    {"Key": "delight", "Emoji": "\u{1F929}",
+     "Instruction": "make this person beam with delight, wide open shining eyes, huge grin",
+     "Pose": "leaning back with shoulders raised and both hands clasped near the chest"}
+  ],
+  "screens": {
+    "green": ", replace the background behind them with a flat solid chroma key green screen, the green must stay behind them and must not touch the person",
+    "blue": ", replace the background behind them with a flat solid chroma key blue screen, the blue must stay behind them and must not touch the person"
+  },
+  "keepBody": ", keep the same person: same face, same hair, same skin tone, wearing the same clothes, same lighting",
+  "keepHead": ", keep the same person, do not change their face, hair, skin tone or clothes, keep the same lighting"
+};
+
+const $ = (s) => document.querySelector(s);
+const state = { photo: null, bg: "bg-dark", mode: "body", cut: "auto", screen: "green", stop: false };
+// Подсказка словами, потому что переключатель меняет СРАЗУ ДВА места: способ
+// вырезания на сервисе и просьбу про зелёный фон в промте. Без зелёного экрана
+// режим "сетка" и проверяется — иначе мы сравниваем не способы, а кадры.
+const CUT_HINT = {
+  auto: "край по зелёному экрану, сетка только страхует",
+  net: "край целиком по birefnet-lite, зелёный экран из промта убран",
+};
+const KEEP = { body: DATA.keepBody, head: DATA.keepHead };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+$("#clGreen").value = DATA.screens.green;
+$("#clKeep").value = KEEP.body;
+
+// ---- карточки --------------------------------------------------------------
+const cards = [];
+function build() {
+  const rows = DATA.emotions.concat([{ Key: "свой", Emoji: "✏️", Instruction: "", Pose: "" }]);
+  for (const e of rows) {
+    const el = document.createElement("div");
+    el.className = "card";
+    el.innerHTML =
+      '<div class="chead">' +
+        '<input type="checkbox" checked>' +
+        '<span class="emo"></span><span class="key"></span>' +
+        '<span class="grow"></span><span class="spin"></span>' +
+      '</div>' +
+      '<div class="shot ' + state.bg + '"></div>' +
+      '<div class="meta"></div><div class="err"></div>' +
+      '<div class="acts">' +
+        '<button class="ghost mini re">повторить</button>' +
+        '<button class="ghost mini dl" disabled>скачать</button>' +
+      '</div>' +
+      '<div class="prompt"><details><summary>промт</summary>' +
+        '<label class="row">действие</label><textarea class="instr"></textarea>' +
+        '<label class="row">поза (только для кадра с телом)</label>' +
+        '<textarea class="pose" style="min-height:40px"></textarea>' +
+      '</details></div>';
+
+    el.querySelector(".emo").textContent = e.Emoji;
+    el.querySelector(".key").textContent = e.Key;
+    el.querySelector(".instr").value = e.Instruction;
+    el.querySelector(".pose").value = e.Pose;
+    $("#grid").appendChild(el);
+
+    const c = {
+      el, key: e.Key, png: null,
+      on: el.querySelector("input[type=checkbox]"),
+      shot: el.querySelector(".shot"), meta: el.querySelector(".meta"),
+      err: el.querySelector(".err"), spin: el.querySelector(".spin"),
+      instr: el.querySelector(".instr"), pose: el.querySelector(".pose"),
+      dl: el.querySelector(".dl"),
+    };
+    el.querySelector(".re").onclick = () => runOne(c);
+    c.dl.onclick = () => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(c.png);
+      a.download = "sticker-" + c.key + ".png";
+      a.click();
+    };
+    c.on.onchange = () => el.classList.toggle("off", !c.on.checked);
+    cards.push(c);
+  }
+}
+build();
+
+// ---- управление ------------------------------------------------------------
+for (const b of document.querySelectorAll("[data-bg]")) {
+  b.onclick = () => {
+    for (const x of document.querySelectorAll("[data-bg]")) {
+      x.setAttribute("aria-pressed", String(x === b));
+    }
+    state.bg = b.dataset.bg;
+    for (const s of document.querySelectorAll(".shot")) s.className = "shot " + state.bg;
+    document.documentElement.dataset.theme = b.dataset.bg === "bg-light" ? "light" : "dark";
+  };
+}
+function setMode(m) {
+  state.mode = m;
+  $("#modeBody").setAttribute("aria-pressed", String(m === "body"));
+  $("#modeHead").setAttribute("aria-pressed", String(m === "head"));
+  $("#clKeep").value = KEEP[m];
+  for (const c of cards) c.pose.parentElement.style.opacity = m === "body" ? 1 : 0.45;
+}
+// Просьбу про экран правят оба переключателя — и цвет, и способ резки, —
+// поэтому собирается она в одном месте, а не в каждом обработчике.
+function applyScreen() {
+  $("#clGreen").value = state.cut === "auto" ? DATA.screens[state.screen] : "";
+}
+function setCut(m) {
+  state.cut = m;
+  $("#cutAuto").setAttribute("aria-pressed", String(m === "auto"));
+  $("#cutNet").setAttribute("aria-pressed", String(m === "net"));
+  $("#cutHint").textContent = CUT_HINT[m];
+  applyScreen();
+}
+function setScreen(c) {
+  state.screen = c;
+  $("#scrGreen").setAttribute("aria-pressed", String(c === "green"));
+  $("#scrBlue").setAttribute("aria-pressed", String(c === "blue"));
+  applyScreen();
+}
+$("#cutAuto").onclick = () => setCut("auto");
+$("#cutNet").onclick = () => setCut("net");
+$("#scrGreen").onclick = () => setScreen("green");
+$("#scrBlue").onclick = () => setScreen("blue");
+$("#modeBody").onclick = () => setMode("body");
+$("#modeHead").onclick = () => setMode("head");
+$("#all").onclick = () => { for (const c of cards) { c.on.checked = true; c.el.classList.remove("off"); } };
+$("#none").onclick = () => { for (const c of cards) { c.on.checked = false; c.el.classList.add("off"); } };
+
+const drop = $("#drop"), file = $("#file");
+drop.onclick = () => file.click();
+file.onchange = () => { if (file.files[0]) setPhoto(file.files[0]); };
+for (const n of ["dragover", "dragenter"]) {
+  drop.addEventListener(n, (e) => { e.preventDefault(); drop.classList.add("on"); });
+}
+for (const n of ["dragleave", "drop"]) {
+  drop.addEventListener(n, (e) => { e.preventDefault(); drop.classList.remove("on"); });
+}
+drop.addEventListener("drop", (e) => {
+  const f = e.dataTransfer.files[0];
+  if (f) setPhoto(f);
+});
+function setPhoto(f) {
+  state.photo = f;
+  const box = $("#dropText");
+  box.textContent = "";
+  const img = new Image();
+  img.src = URL.createObjectURL(f);
+  box.appendChild(img);
+}
+
+// ---- промт и сеть ----------------------------------------------------------
+function promptOf(c) {
+  let p = c.instr.value.trim();
+  if (state.mode === "body" && c.pose.value.trim()) p += ", " + c.pose.value.trim();
+  return p + $("#clGreen").value + $("#clKeep").value;
+}
+
+async function submit(prompt, seed, sticker, cut) {
+  const fd = new FormData();
+  fd.append("prompt", prompt);
+  fd.append("sticker", sticker ? "true" : "false");
+  fd.append("cut", cut);
+  if (seed !== "") fd.append("seed", seed);
+  fd.append("files", state.photo, "photo.png");
+  for (;;) {
+    const r = await fetch("/api/edit", { method: "POST", body: fd });
+    // 429 — у сервиса предел задач в работе на одного человека, это не ошибка.
+    if (r.status === 429) { await sleep(8000); continue; }
+    if (!r.ok) throw new Error("сервис ответил " + r.status);
+    return (await r.json()).id;
+  }
+}
+
+async function result(id) {
+  for (;;) {
+    if (state.stop) throw new Error("остановлено");
+    const d = await (await fetch("/api/result?id=" + id)).json();
+    if (d.status === "done") return d.data;
+    if (d.status === "error") throw new Error(d.data);
+    await sleep(2500);
+  }
+}
+
+function toBlob(b64) {
+  const bin = atob(b64), a = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
+  return new Blob([a], { type: "image/png" });
+}
+
+// ---- мерки -----------------------------------------------------------------
+// Те же три числа, по которым мы ловили дефекты: сколько вырезано, сколько
+// осталось зелёного на человеке и сколько полупрозрачного светлого фона.
+async function measure(blob, blue) {
+  const bmp = await createImageBitmap(blob);
+  const cv = document.createElement("canvas");
+  cv.width = bmp.width; cv.height = bmp.height;
+  const cx = cv.getContext("2d", { willReadFrequently: true });
+  cx.drawImage(bmp, 0, 0);
+  const d = cx.getImageData(0, 0, bmp.width, bmp.height).data;
+  let clear = 0, green = 0, haze = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], g = d[i + 1], b = d[i + 2], a = d[i + 3];
+    if (a === 0) { clear++; continue; }
+    const tint = blue ? b - Math.max(r, g) : g - Math.max(r, b);
+    if (a > 127 && tint > 25) green++;
+    if (a > 20 && a <= 127 && Math.min(r, g, b) > 170) haze++;
+  }
+  const total = d.length / 4;
+  return { size: bmp.width + "x" + bmp.height, clear: (100 * clear / total).toFixed(1), green, haze };
+}
+
+// ---- прогон ----------------------------------------------------------------
+async function runOne(c) {
+  if (!state.photo) { say("сначала фото"); return; }
+  c.err.textContent = ""; c.meta.textContent = ""; c.spin.textContent = "...";
+  const t0 = performance.now();
+  try {
+    const seed = $("#seed").value, cut = state.cut, screen = state.screen;
+    const png = toBlob(await result(await submit(promptOf(c), seed, true, cut)));
+    c.png = png;
+    const secs = ((performance.now() - t0) / 1000).toFixed(0);
+    show(c, png);
+    const m = await measure(png, screen === "blue");
+    c.meta.innerHTML =
+      "<span>" + m.size + "</span><span>" + secs + " с</span>" +
+      "<span>" + (cut === "net" ? "сетка" : "экран " + screen) + "</span>" +
+      "<span>прозрачно <b>" + m.clear + "%</b></span>" +
+      '<span class="' + (m.green ? "bad" : "ok") + '">цвета экрана <b>' + m.green + "</b></span>" +
+      '<span class="' + (m.haze > 200 ? "bad" : "ok") + '">дымки <b>' + m.haze + "</b></span>";
+    c.dl.disabled = false;
+
+    // Сырой кадр нужен ровно для одного вопроса: это испортила модель или
+    // вырезание. Кладём его вторым слоем, он проявляется по наведению.
+    if ($("#raw").checked) {
+      const raw = toBlob(await result(await submit(promptOf(c), seed, false, cut)));
+      const im = new Image();
+      im.src = URL.createObjectURL(raw);
+      im.style.opacity = "0";
+      im.style.transition = "opacity .12s";
+      c.shot.appendChild(im);
+      c.shot.onmouseenter = () => { im.style.opacity = "1"; };
+      c.shot.onmouseleave = () => { im.style.opacity = "0"; };
+      c.meta.insertAdjacentHTML("beforeend", "<span>наведи — сырой кадр</span>");
+    }
+  } catch (e) {
+    c.err.textContent = String(e.message || e);
+  } finally {
+    c.spin.textContent = "";
+  }
+}
+
+function show(c, blob) {
+  c.shot.textContent = "";
+  const img = new Image();
+  img.src = URL.createObjectURL(blob);
+  c.shot.appendChild(img);
+}
+function say(t) { $("#status").textContent = t; }
+
+$("#go").onclick = async () => {
+  if (!state.photo) { say("сначала фото"); return; }
+  const queue = cards.filter((c) => c.on.checked && c.instr.value.trim());
+  if (!queue.length) { say("ничего не выбрано"); return; }
+
+  state.stop = false;
+  $("#go").disabled = true; $("#stop").disabled = false;
+  const t0 = performance.now();
+  let done = 0;
+
+  const worker = async () => {
+    while (queue.length && !state.stop) {
+      await runOne(queue.shift());
+      done++;
+      say("готово " + done + ", осталось " + queue.length);
+    }
+  };
+  await Promise.all(Array.from({ length: +$("#par").value }, worker));
+
+  say("всё: " + done + " шт за " + ((performance.now() - t0) / 1000).toFixed(0) + " с");
+  $("#go").disabled = false; $("#stop").disabled = true;
+};
+$("#stop").onclick = () => { state.stop = true; say("останавливаюсь..."); };
+
+setMode("body");
+setCut("auto");
+setScreen("green");
+</script>
+</body>
+</html>

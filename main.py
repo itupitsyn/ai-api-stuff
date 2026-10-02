@@ -88,6 +88,10 @@ class Item(BaseModel):
     # Готовить ли результат как стикер: вырезать фон, обрезать по объекту и
     # вписать в квадрат 512x512 с прозрачностью. Подробности в cutout.py.
     sticker: bool = False
+    # Чем искать край при вырезании: "auto" — по зелёному экрану, если он на
+    # кадре есть, иначе по сетке; "net" — всегда по сетке. Бот не присылает,
+    # поле нужно стенду, чтобы сравнивать способы на одном кадре.
+    cut: Literal[tuple(cutout.CUT_MODES)] = cutout.CUT_AUTO
     # Размер кадра. Относится ТОЛЬКО к видео: у картинок он берётся из
     # реестра ("size" в IMAGE_MODELS), потому что у каждой модели свои
     # удобные кратности. Бот его для картинок и не присылает — до
@@ -1727,9 +1731,11 @@ def worker(results, lock, card):
                         # копится и у разных эмоций разный. У txt2img исходника
                         # нет, и тон тогда не трогается. См. cutout._match_tone.
                         src = _stat_field(data, "images")
-                        cut = cutout.to_sticker(png, source=src[0] if src else None)
-                        if cut is not None:
-                            png = cut
+                        out = cutout.to_sticker(
+                            png, source=src[0] if src else None,
+                            mode=_stat_field(data, "cut") or cutout.CUT_AUTO)
+                        if out is not None:
+                            png = out
 
                     set_result(id, Status.DONE, base64.b64encode(png))
 
@@ -1825,6 +1831,31 @@ async def root():
     return {"status": "ok"}
 
 
+# Путь к стенду стикеров. Файл лежит в примонтированном каталоге, а не в
+# образе, НАРОЧНО: страницу можно править прямо на хосте, не пересобирая
+# сервис, а пересборка здесь стоит минут и простоя генерации.
+STICKER_UI = os.getenv("STICKER_UI", "/root/ui/stickers.html")
+
+
+@app.get("/ui")
+async def sticker_ui():
+    """Страница для ручной проверки стикеров.
+
+    Отдаётся отсюда, а не живёт отдельным сайтом, по одной причине: так она
+    ходит в API со своего же адреса, и не нужны ни CORS, ни разрешения на
+    смешанный контент.
+    """
+    try:
+        with open(STICKER_UI, "rb") as f:
+            page = f.read()
+    except OSError:
+        raise HTTPException(status_code=404, detail="стенд не установлен")
+
+    # Стенд меняется чаще, чем кеш успевает протухнуть, поэтому не кешируем.
+    return Response(page, media_type="text/html; charset=utf-8",
+                    headers={"Cache-Control": "no-store"})
+
+
 def enqueue_or_reject(job):
     """Ставит задачу в очередь либо отвечает 429, если у человека их уже полно.
 
@@ -1861,6 +1892,7 @@ async def edit(
     user: int | None = Form(None),
     chat: int | None = Form(None),      # см. комментарий у Item.chat
     sticker: bool = Form(False),        # см. комментарий у Item.sticker
+    cut: str = Form(cutout.CUT_AUTO),   # см. комментарий у Item.cut
     # см. комментарий у Item.source_prompt
     source_prompt: str | None = Form(None),
     style: str | None = Form(None),
@@ -1878,6 +1910,10 @@ async def edit(
         raise HTTPException(
             status_code=400,
             detail=f"максимум {EDIT_MAX_IMAGES} картинки, пришло {len(files)}")
+    if cut not in cutout.CUT_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"cut: {', '.join(cutout.CUT_MODES)}")
 
     id = str(uuid.uuid4())
     print("edit", id, len(files), "файл(ов)")
@@ -1891,7 +1927,7 @@ async def edit(
         "user": user,
         "data": {"prompt": prompt, "images": images, "steps": steps, "seed": seed,
                  "source_prompt": source_prompt, "style": style, "chat": chat,
-                 "sticker": sticker},
+                 "sticker": sticker, "cut": cut},
     })
 
     return {"id": id}
